@@ -88,6 +88,9 @@ module emu (
     "O[6],Debug Video,Off,On;",
     "O[8:7],Debug View,Events,CPU,Melody,Core;",
     "O[9],Debug Freeze,Off,On;",
+    "O[14],Video Mode,Digital,Analog;",
+    "O[11:10],Analog Size,100%,75%,50%;",
+    "O[13:12],Analog Rotate,0,90,180,270;",
     "-;",
     "-;",
     "R[0],Reset;",
@@ -144,7 +147,7 @@ module emu (
       .status_menumask(16'd0),
 
       .video_rotated(1'b0),
-      .new_vmode(1'b0),
+      .new_vmode(new_vmode),
 
       .info_req(1'b0),
       .info(8'd0),
@@ -171,6 +174,12 @@ module emu (
   wire debug_video = status[6];
   wire [1:0] debug_view = status[8:7];
   wire debug_freeze = status[9];
+  
+  wire [1:0] crt_size = status[11:10];
+  wire [1:0] rotate_sel = status[13:12];
+  wire       output_crt_15k = status[14];
+  reg output_crt_15k_d = 1'b0;
+  reg new_vmode = 1'b0;
 
   reg [7:0] lcd_off_alpha;
 
@@ -274,6 +283,10 @@ module emu (
 
       .accurate_lcd_timing(accurate_lcd_timing),
       .lcd_off_alpha(lcd_off_alpha),
+		
+      .crt_size(crt_size),
+      .rotate_sel(rotate_sel),
+      .output_crt_15k(output_crt_15k),
 
       .debug_video(debug_video),
       .debug_view(debug_view),

@@ -43,6 +43,10 @@ module gameandwatch (
     // Settings
     input wire accurate_lcd_timing, // Use precise timing to update the cached LCD segments based on H timing. This doesn't look good, hence the setting
     input wire [7:0] lcd_off_alpha, // The alpha value of all disabled/off LCD segments. This allows the LCD to stay visible at all times
+	 
+    input wire [1:0] crt_size,
+    input wire [1:0] rotate_sel,
+    input wire output_crt_15k,
 
     // Debug
     input wire debug_video,
@@ -333,6 +337,23 @@ module gameandwatch (
   wire [63:0] video_debug_cpu_state = debug_freeze ? debug_cpu_state_frozen : debug_cpu_state;
   wire [63:0] video_debug_melody_state = debug_freeze ? debug_melody_state_frozen : debug_melody_state;
   wire [63:0] video_debug_core_state = debug_freeze ? debug_core_state_frozen : debug_core_state;
+  
+  reg output_crt_15k_d = 1'b0;
+  reg [3:0] video_mode_reset_cnt = 4'd0;
+
+  wire video_mode_reset = |video_mode_reset_cnt;
+
+  always @(posedge clk_sys_99_287) begin
+    output_crt_15k_d <= output_crt_15k;
+
+    if (reset) begin
+      video_mode_reset_cnt <= 4'd0;
+    end else if (output_crt_15k_d != output_crt_15k) begin
+      video_mode_reset_cnt <= 4'd15;
+    end else if (video_mode_reset_cnt != 4'd0) begin
+      video_mode_reset_cnt <= video_mode_reset_cnt - 4'd1;
+    end
+  end
 
   ////////////////////////////////////////////////////////////////////////////////////////
   // Video
@@ -349,7 +370,7 @@ module gameandwatch (
       .clk_sys_99_287(clk_sys_99_287),
       .clk_vid_33_095(clk_vid_33_095),
 
-      .reset(reset || ioctl_download),
+      .reset(reset || ioctl_download || video_mode_reset),
 
       .cpu_id(cpu_id),
 
@@ -371,6 +392,9 @@ module gameandwatch (
 
       // Settings
       .lcd_off_alpha(lcd_off_alpha),
+      .crt_size(crt_size),
+      .rotate_sel(rotate_sel),
+      .output_crt_15k(output_crt_15k),
 
       // Debug
       .debug_video(debug_video),
