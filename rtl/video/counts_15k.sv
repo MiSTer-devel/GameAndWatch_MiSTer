@@ -16,9 +16,9 @@ module counts_15k (
   localparam HEIGHT = 10'd240;
 
   // Horizontal timing: 320 active + 6 fp + 4 sync + 21 bp = 351 total
-  localparam H_FP   = 10'd6;
-  localparam H_SYNC = 10'd4;
-  localparam H_BP   = 10'd21;
+  localparam H_FP   = 10'd5;
+  localparam H_SYNC = 10'd24;
+  localparam H_BP   = 10'd2;
 
   // Vertical timing: 240 active + 4 fp + 3 sync + 15 bp = 262 total
   localparam V_FP   = 10'd4;
