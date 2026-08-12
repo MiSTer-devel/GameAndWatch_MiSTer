@@ -6,6 +6,7 @@
 * [Registers](registers.md) - Registers across the CPU and what they do
 * [SM530 Support Notes](sm530.md) - Implementation notes and known limits for Nelsonic SM530 Game Watch titles
 * [ROM Generator](rom_generator.md) - Tool to create the ROMs
+* [CRT Video Mode](crt_video.md) - Notes on the selectable 360x240 CRT/direct-video output path
 
 ## Implementation
 

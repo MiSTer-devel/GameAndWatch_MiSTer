@@ -1,6 +1,4 @@
-module mask #(
-    parameter CLOCK_RATIO = 3
-) (
+module mask (
     input wire clk,
 
     input wire reset,
@@ -8,10 +6,12 @@ module mask #(
     input wire        ioctl_wr,
     input wire [15:0] ioctl_dout,
 
+    input wire crt_video,
     input wire vblank,
     input wire hblank,
-    input wire [9:0] video_x,
+    input wire [10:0] video_x,
     input wire [9:0] video_y,
+    input wire [1:0] source_x_step,
 
     output reg [9:0] segment_id = 0,  // Cycle delayed to only update on video_clock cycles
     output reg has_segment = 0 // Cycle delayed in_segment to properly track the cycles we should render segments
@@ -71,19 +71,19 @@ module mask #(
     wren <= 0;
 
     if (buffer_16_bytes > 0) begin
-      // Write. Load next byte into buffer
+      // Write. Load next byte into buffer.
       buffer_40 <= {buffer_16[7:0], buffer_40[39:8]};
       buffer_40_bytes <= buffer_40_bytes + 3'h1;
 
       if (buffer_40_bytes + 3'h1 == 3'h5) begin
-        // This was last byte, write
+        // This was last byte, write.
         wren <= 1;
         buffer_40_bytes <= 3'h0;
       end
     end
 
     if (~wren && prev_wren) begin
-      // Finished write, increment addr
+      // Finished write, increment addr.
       write_addr <= write_addr + 16'h1;
     end
   end
@@ -91,54 +91,43 @@ module mask #(
   ////////////////////////////////////////////////////////////////////////////////////////
   // Mask pixel selection
 
-  localparam CLOCK_RATIO_START_VALUE = CLOCK_RATIO - 1;
-  localparam VID_COUNTER_DEPTH = $clog2(CLOCK_RATIO_START_VALUE + 1);
+  reg [3:0] vid_counter = 0;
 
-  // Currently in segment
-  reg in_segment = 0;
-  reg [9:0] length = 0;
-  reg [VID_COUNTER_DEPTH -1 : 0] vid_counter = 0;
+  wire [3:0] vid_counter_start = crt_video ? 4'd14 : 4'd2;
+  wire sample_tick = vid_counter == 4'd0;
+  wire [10:0] current_x = video_x;
+  wire [10:0] next_sample_x = current_x + {9'd0, source_x_step};
+  wire [10:0] segment_end_x = {1'b0, segment_start_x} + {1'b0, segment_length};
+  wire same_row = segment_y == video_y;
+  wire valid_entry = segment_length != 10'd0;
+  wire sampled_segment = valid_entry && same_row && current_x >= {1'b0, segment_start_x} &&
+      current_x < segment_end_x;
+  wire stale_segment = valid_entry && ((segment_y < video_y) ||
+      (same_row && segment_end_x <= current_x));
 
   always @(posedge clk) begin
-    has_segment <= in_segment;
+    has_segment <= 0;
 
     if (vid_counter > 0) begin
-      vid_counter <= vid_counter - 1'b1;
+      vid_counter <= vid_counter - 4'd1;
     end else begin
-      vid_counter <= CLOCK_RATIO_START_VALUE[VID_COUNTER_DEPTH-1:0];
+      vid_counter <= vid_counter_start;
     end
 
     if (vblank) begin
       read_addr  <= 0;
-      in_segment <= 0;
+      vid_counter <= 0;
+    end else if (stale_segment) begin
+      read_addr   <= read_addr + 16'h1;
+      has_segment <= 0;
     end else if (hblank) begin
-      in_segment <= 0;
-    end else if (vid_counter == 0) begin
+      has_segment <= 0;
+    end else if (sample_tick) begin
       segment_id <= next_segment_id;
+      has_segment <= sampled_segment;
 
-      if (video_x == segment_start_x && video_y == segment_y) begin
-        // Beginning of segment
-        // This takes priority over existing segment, as the segments may come one right after another
-        in_segment <= 1;
-        // TODO: Change to actual segment status by using ID
-        has_segment <= 1;
-
-        length <= segment_length - 10'h1;
-
-        if (segment_length == 10'h1) begin
-          read_addr <= read_addr + 16'h1;
-        end
-      end else if (in_segment) begin
-        // Existing segment
-        length <= length - 10'h1;
-
-        in_segment <= length > 10'h0;
-
-        if (length == 10'h1) begin
-          read_addr <= read_addr + 16'h1;
-        end
-      end else begin
-        has_segment <= 0;
+      if (sampled_segment && next_sample_x >= segment_end_x) begin
+        read_addr <= read_addr + 16'h1;
       end
     end
   end

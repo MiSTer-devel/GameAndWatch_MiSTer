@@ -411,3 +411,31 @@ No core video, audio, ROM loader, CPU, or LCD behavior was changed as part of th
 - Added SM530-specific CPU debug rows: row 6 now shows all eight `K/KE` input bits, row 7 shows `{ram_wr, last_ram_write_addr}`, and row 8 shows `{last_ram_write_data, last_ram_read_data}`.
 - Changed Core debug rows for SM530 packages to show LCD output groups 0, 1, 2, 3, and 11 from the latched SM530 A/B LCD RAM path. Group 11 is useful for `nsmb3` because the boot code writes that display group almost immediately.
 - Updated the debug overlay notes with a short SM530 bring-up capture procedure so hardware snapshots can distinguish CPU execution/halt/input problems from LCD normalization problems.
+
+## 2026-06-04 selectable CRT native video mode
+
+- Added `Native Video` to the MiSTer OSD with the new `720x240 CRT` path as the default and the existing `720x720` path as a selectable compatibility mode.
+- Moved the core-facing video handoff to the 99.287 MHz core clock and made both modes explicit `CE_PIXEL` modes. The old 720x720 path uses `/3`, preserving its effective 33.095 MHz cadence. The CRT path uses `/6`, producing an effective 16.55 MHz pixel cadence.
+- Added dynamic timing in `rtl/video/counts.sv`: the CRT path outputs 720 active pixels by 240 active lines inside a 1052x263 total raster, which lands near 15.73 kHz horizontal and 59.8 Hz vertical.
+- Kept existing 720x720 `.gnw` packages compatible by sampling source row `output_y * 3 + 1` for SDRAM image reads in CRT mode.
+- Updated the LCD mask path to use a single original-style reader against the sampled 720p source row. During CRT-mode horizontal blanking the reader advances to the next sampled source row; otherwise it can stall on a skipped 720p row and active LCD segments disappear.
+- Allowed `CE_PIXEL` to free-run while the core is reset before ROM load. Holding the pixel enable reset made the default CRT timing run at the full video clock and prevented the OSD from syncing on a CRT until a game was loaded.
+- Documented the limitation: this is a bridge for hardware testing. A generator-native 720x240 package path is still the better long-term presentation solution because it can render masks directly at the CRT target and simplify the real-time mask bridge.
+
+## 2026-06-04 CRT mask rollback
+
+- Reverted the experimental three-row/time-sliced LCD mask merge after hardware testing showed the CRT mode only displayed part of the loaded game and lost active LCD graphics.
+- Restored the simple single-reader CRT bridge: existing 720x720 packages are still reduced to 720x240 by sampling one source row per output row, and the LCD mask walker advances during horizontal blanking to the next sampled source row.
+- Kept `Native Video = 720x240 CRT` as the default and kept the free-running `CE_PIXEL` fix so the OSD remains visible before ROM load.
+- The remaining corruption risk is the known point-sampling limitation of using 720x720 packages on a 240p output. The better long-term fix remains generator-native 720x240 artwork/mask packages, rather than more real-time mask reconstruction in RTL.
+
+## 2026-06-04 May 9 360x240 CRT retry
+
+- Revisited the early May 9 hardware result where the simple 360x240 15 kHz transport was reported working on CRT before later preservation/timing reverts.
+- Changed the default `Native Video` mode from the failed 720x240 experiment to `360x240 CRT`, while keeping `720x720` selectable for comparison.
+- Restored the raw MiSTer video clock to the 32.768 MHz PLL output. In 720x720 mode `CE_PIXEL` is asserted every video clock; in CRT mode it is divided by 5, yielding a 6.5536 MHz pixel cadence.
+- Changed CRT counters to 360 active pixels by 240 active lines inside a 416x262 total raster, for approximately 15.75 kHz horizontal scan.
+- Kept existing 720x720 `.gnw` packages compatible by point-sampling the packed image layers at `source_x = output_x * 2` and `source_y = output_y * 3`.
+- Restored a core-clocked LCD mask walker cadence instead of consuming `CE_PIXEL` directly across clock domains. The mask reader advances once every 3 core clocks in 720x720 mode and once every 15 core clocks in CRT mode.
+- Updated the mask walker to compare sampled output pixels against the original 720x720 source coordinate range, so segments whose RLE spans a sampled point can still light even when the segment start coordinate itself is skipped.
+- Left `sys/` untouched.

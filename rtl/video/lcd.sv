@@ -1,6 +1,4 @@
-module lcd #(
-    parameter CLOCK_RATIO = 3
-) (
+module lcd (
     input wire clk,
 
     input wire reset,
@@ -24,10 +22,12 @@ module lcd #(
     input wire divider_1khz,
 
     // Video counters
+    input wire crt_video,
     input wire vblank_int,
     input wire hblank_int,
-    input wire [9:0] video_x,
+    input wire [10:0] video_x,
     input wire [9:0] video_y,
+    input wire [1:0] source_x_step,
 
     output wire segment_en
 );
@@ -70,7 +70,6 @@ module lcd #(
   );
 
   segments #(
-      .CLOCK_RATIO  (CLOCK_RATIO),
       .MAX_X_SEGMENT(MAX_X_SEGMENT),
       .MAX_Y_SEGMENT(MAX_Y_SEGMENT),
       .MAX_Z_SEGMENT(MAX_Z_SEGMENT)
@@ -86,10 +85,12 @@ module lcd #(
 
       .segments(vsync_segments),
 
+      .crt_video(crt_video),
       .vblank_int(vblank_int),
       .hblank_int(hblank_int),
       .video_x(video_x),
       .video_y(video_y),
+      .source_x_step(source_x_step),
 
       .segment_en(segment_en)
   );

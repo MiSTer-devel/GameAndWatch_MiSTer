@@ -1,12 +1,11 @@
-module video #(
-    parameter CLOCK_RATIO = 3
-) (
+module video (
     input wire clk_sys_99_287,
     input wire clk_vid_33_095,
 
     input wire reset,
 
     input wire [3:0] cpu_id,
+    input wire crt_video,
 
     // Data in
     input wire mask_data_wr,
@@ -53,8 +52,15 @@ module video #(
     output wire sd_rd,
     output wire [24:0] sd_rd_addr
 );
-  wire [9:0] video_x;
+  wire [10:0] video_x;
   wire [9:0] video_y;
+  wire [9:0] next_video_y = video_y >= (crt_video ? 10'd239 : 10'd719) ? 10'd0 : video_y + 10'd1;
+  wire [10:0] source_x = crt_video ? {1'b0, video_x[8:0], 1'b0} : video_x;
+  wire [9:0] source_y = crt_video ? ({video_y[7:0], 1'b0} + video_y) : video_y;
+  wire [9:0] next_source_y = crt_video ? ({next_video_y[7:0], 1'b0} + next_video_y) : source_y;
+  wire [10:0] mask_x = crt_video && hblank_int ? 11'd0 : source_x;
+  wire [9:0] mask_y = crt_video && hblank_int ? next_source_y : source_y;
+  wire [1:0] source_x_step = crt_video ? 2'd2 : 2'd1;
 
   wire hsync_int;
   wire vsync_int;
@@ -62,16 +68,25 @@ module video #(
   wire vblank_int;
 
   wire de_int;
-  assign ce_pix = 1'b1;
+
+  reg [2:0] ce_counter = 0;
+  wire [2:0] ce_terminal = crt_video ? 3'd4 : 3'd0;
+  assign ce_pix = ce_counter == 3'd0;
+
+  always @(posedge clk_vid_33_095) begin
+    if (ce_counter == ce_terminal) begin
+      ce_counter <= 3'd0;
+    end else begin
+      ce_counter <= ce_counter + 3'd1;
+    end
+  end
 
   ////////////////////////////////////////////////////////////////////////////////////////
   // LCD
 
   wire segment_en;
 
-  lcd #(
-      .CLOCK_RATIO(CLOCK_RATIO)
-  ) lcd (
+  lcd lcd (
       .clk(clk_sys_99_287),
 
       .reset(reset),
@@ -95,10 +110,12 @@ module video #(
       .divider_1khz(divider_1khz),
 
       // Video counters
+      .crt_video(crt_video),
       .vblank_int(vblank_int),
       .hblank_int(hblank_int),
-      .video_x(video_x),
-      .video_y(video_y),
+      .video_x(mask_x),
+      .video_y(mask_y),
+      .source_x_step(source_x_step),
 
       .segment_en(segment_en)
   );
@@ -120,10 +137,11 @@ module video #(
   );
 
   wire [2:0] debug_col = video_x[8:6];
-  wire [2:0] debug_row = video_y[8:6];
+  wire [2:0] debug_row = crt_video ? video_y[7:5] : video_y[8:6];
   wire [5:0] debug_idx = {debug_row, debug_col};
-  wire debug_panel = video_x < 10'd512 && video_y < 10'd512;
-  wire debug_grid = (video_x[5:0] == 6'd0) || (video_y[5:0] == 6'd0);
+  wire debug_panel = video_x < 11'd512 && video_y < (crt_video ? 10'd240 : 10'd512);
+  wire debug_grid = crt_video ? ((video_x[5:0] == 6'd0) || (video_y[4:0] == 5'd0)) :
+      ((video_x[5:0] == 6'd0) || (video_y[5:0] == 6'd0));
 
   reg [63:0] debug_bits;
   always_comb begin
@@ -171,6 +189,8 @@ module video #(
       .reset(reset),
 
       // Video
+      .ce_pix(ce_pix),
+      .crt_video(crt_video),
       .hblank_int(hblank_int),
       .video_y(video_y),
       .de_int(de_int),
@@ -203,6 +223,7 @@ module video #(
   counts counts (
       .clk(clk_vid_33_095),
       .ce_pix(ce_pix),
+      .crt_video(crt_video),
 
       .x(video_x),
       .y(video_y),

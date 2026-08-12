@@ -72,14 +72,13 @@ module emu (
   assign LED_USER = 0;
   assign BUTTONS[1] = 0;
 
-  assign VIDEO_ARX = 13'd1;
-  assign VIDEO_ARY = 13'd1;
-
   `include "build_id.v"
 
   localparam CONF_STR = {
     "Game and Watch;;",
     "FS0,gnw,Load ROM;",
+    "-;",
+    "O[10],Native Video,360x240 CRT,720x720;",
     "-;",
     "O[5:2],Inactive LCD Alpha,Off,5%,10%,20%,30%,40%,50%,60%,70%,80%,90%,100%;",
     "-;",
@@ -101,6 +100,7 @@ module emu (
   wire clk_sys_99_287;
   wire clk_vid_33_095;
   wire pll_core_locked;
+  wire clk_video = clk_vid_33_095;
 
   pll pll (
       .refclk  (CLK_50M),
@@ -171,6 +171,10 @@ module emu (
   wire debug_video = status[6];
   wire [1:0] debug_view = status[8:7];
   wire debug_freeze = status[9];
+  wire crt_video = ~status[10];
+
+  assign VIDEO_ARX = crt_video ? 13'd4 : 13'd1;
+  assign VIDEO_ARY = crt_video ? 13'd3 : 13'd1;
 
   reg [7:0] lcd_off_alpha;
 
@@ -239,7 +243,7 @@ module emu (
 
   gameandwatch gameandwatch (
       .clk_sys_99_287(clk_sys_99_287),
-      .clk_vid_33_095(clk_vid_33_095),
+      .clk_vid_33_095(clk_video),
 
       .reset(RESET || ioctl_download || ~has_rom || external_reset || hps_buttons[1]),
       .pll_core_locked(pll_core_locked),
@@ -274,6 +278,7 @@ module emu (
 
       .accurate_lcd_timing(accurate_lcd_timing),
       .lcd_off_alpha(lcd_off_alpha),
+      .crt_video(crt_video),
 
       .debug_video(debug_video),
       .debug_view(debug_view),
@@ -292,7 +297,7 @@ module emu (
       .SDRAM_nWE(SDRAM_nWE)
   );
 
-  assign CLK_VIDEO = clk_vid_33_095;
+  assign CLK_VIDEO = clk_video;
   assign CE_PIXEL = ce_pix;
 
   assign VGA_R = rgb[23:16];

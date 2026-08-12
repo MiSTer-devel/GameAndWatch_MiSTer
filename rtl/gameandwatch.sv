@@ -43,6 +43,7 @@ module gameandwatch (
     // Settings
     input wire accurate_lcd_timing, // Use precise timing to update the cached LCD segments based on H timing. This doesn't look good, hence the setting
     input wire [7:0] lcd_off_alpha, // The alpha value of all disabled/off LCD segments. This allows the LCD to stay visible at all times
+    input wire crt_video,
 
     // Debug
     input wire debug_video,
@@ -348,15 +349,14 @@ module gameandwatch (
   wire        sd_rd;
   wire [24:0] sd_rd_addr;
 
-  video #(
-      .CLOCK_RATIO(3)
-  ) video (
+  video video (
       .clk_sys_99_287(clk_sys_99_287),
       .clk_vid_33_095(clk_vid_33_095),
 
       .reset(reset || ioctl_download),
 
       .cpu_id(cpu_id),
+      .crt_video(crt_video),
 
       .mask_data_wr(mask_config_download && ioctl_wr),
       .mask_data(ioctl_dout),

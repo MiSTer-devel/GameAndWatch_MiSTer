@@ -1,6 +1,4 @@
 module segments #(
-    parameter CLOCK_RATIO = 3,
-
     parameter MAX_X_SEGMENT = 9,
     parameter MAX_Y_SEGMENT = 16,
     parameter MAX_Z_SEGMENT = 4
@@ -17,10 +15,12 @@ module segments #(
     input wire [MAX_Z_SEGMENT-1:0] segments[MAX_X_SEGMENT][MAX_Y_SEGMENT],
 
     // Video counters
+    input wire crt_video,
     input wire vblank_int,
     input wire hblank_int,
-    input wire [9:0] video_x,
+    input wire [10:0] video_x,
     input wire [9:0] video_y,
+    input wire [1:0] source_x_step,
 
     // Comb
     output reg segment_en
@@ -36,9 +36,7 @@ module segments #(
 
   wire has_segment;
 
-  mask #(
-      .CLOCK_RATIO(CLOCK_RATIO)
-  ) mask (
+  mask mask (
       .clk(clk),
 
       .reset(reset),
@@ -46,10 +44,12 @@ module segments #(
       .ioctl_wr  (mask_data_wr),
       .ioctl_dout(mask_data),
 
+      .crt_video(crt_video),
       .vblank (vblank_int),
       .hblank (hblank_int),
       .video_x(video_x),
       .video_y(video_y),
+      .source_x_step(source_x_step),
 
       .segment_id ({segment_line_select, segment_column, segment_row}),
       .has_segment(has_segment)
