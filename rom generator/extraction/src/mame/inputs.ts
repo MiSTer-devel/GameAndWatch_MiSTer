@@ -8,13 +8,18 @@ import {
 
 const PORT_START_REGEX = /^\s*PORT_START\("(.*)"\)/;
 
-/**
- * Captures bit, high/low active status, input, and optional name
- */
+/** Captures bit, high/low active status, and input. */
 const PORT_BIT_REGEX =
-  /PORT_BIT\(\s*([0-9A-Fx]+)\s*,\s*(.*?)\s*,\s*(.*?)\s*\).*(?:PORT_NAME\("(.*)"\))?/;
+  /PORT_BIT\(\s*([0-9A-Fa-fxX]+)\s*,\s*(.*?)\s*,\s*(.*?)\s*\)/;
 
-const PORT_CONFSETTING_REGEX = /PORT_CONFSETTING\(\s*([0-9A-Fx]+)\s*,/;
+// Parse PORT_NAME separately. Making this an optional suffix of PORT_BIT lets
+// the preceding wildcard consume it while the overall expression still
+// succeeds, silently dropping every human-readable input name.
+const PORT_NAME_REGEX = /PORT_NAME\(\s*(?:u8|u|U|L)?"([^"]*)"\s*\)/;
+
+const PORT_PLAYER_REGEX = /PORT_PLAYER\(\s*([0-9]+)\s*\)/;
+
+const PORT_CONFSETTING_REGEX = /PORT_CONFSETTING\(\s*([0-9A-Fa-fxX]+)\s*,/;
 
 const PORT_INCLUDE_REGEX = /PORT_INCLUDE\(\s*(.*)\s*\)/;
 
@@ -36,6 +41,7 @@ export const parseInputs = (
   const lines = inputBody.trim().split("\n");
 
   let currentPort: Port | undefined = undefined;
+  let ignoredPortBody = false;
   const ports: Port[] = [];
 
   // If set, this port includes port mapping from another console
@@ -57,7 +63,13 @@ export const parseInputs = (
         ports.push(currentPort);
       }
 
+      // A new MAME port always ends the preceding physical port. Unsupported
+      // pseudo-ports such as "FAKE" must not leave currentPort pointing at it,
+      // or their following bits will overwrite and duplicate the prior port.
+      currentPort = undefined;
+
       const portType = parsePortName(name, deviceName);
+      ignoredPortBody = !portType;
 
       if (portType) {
         switch (portType.type) {
@@ -81,7 +93,12 @@ export const parseInputs = (
 
     match = line.match(PORT_BIT_REGEX);
     if (match) {
-      const [_, unparsedBit, unparsedActive, unparsedButton, portName] = match;
+      const [_, unparsedBit, unparsedActive, unparsedButton] = match;
+      const portName = line.match(PORT_NAME_REGEX)?.[1];
+      const playerMatch = line.match(PORT_PLAYER_REGEX);
+      const player = playerMatch
+        ? Number.parseInt(playerMatch[1], 10)
+        : undefined;
 
       const bit = parseInt(
         unparsedBit.startsWith("0x") ? unparsedBit.slice(2) : unparsedBit,
@@ -99,9 +116,14 @@ export const parseInputs = (
       }
 
       const activeHigh =
-        unparsedActive === "IP_ACTIVE_HIGH" || button.startsWith("custom");
+        unparsedActive === "IP_ACTIVE_HIGH" ||
+        button.startsWith("custom") ||
+        button === "dial";
 
       if (!currentPort) {
+        if (ignoredPortBody) {
+          continue;
+        }
         console.log(
           `Attempted to add button ${line} without port to device ${deviceName}`
         );
@@ -112,6 +134,7 @@ export const parseInputs = (
         action: button,
         activeLow: !activeHigh,
         name: portName,
+        player,
       };
 
       if (currentPort.type === "s") {
@@ -407,6 +430,10 @@ const parseButton = (button: string, line = ""): Action | undefined => {
       return "service1";
     case "IPT_SERVICE2":
       return "service2";
+    case "IPT_SERVICE3":
+      return "service3";
+    case "IPT_SERVICE4":
+      return "service4";
 
     case "IPT_VOLUME_DOWN":
       return "volumeDown";
@@ -414,6 +441,9 @@ const parseButton = (button: string, line = ""): Action | undefined => {
       return "powerOn";
     case "IPT_POWER_OFF":
       return "powerOff";
+
+    case "IPT_DIAL":
+      return "dial";
 
     // Keypad is not supported
     case "IPT_KEYPAD":

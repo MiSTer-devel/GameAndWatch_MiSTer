@@ -1,14 +1,22 @@
-module video (
+module video #(
+    parameter EXTERNAL_CRT_TICK = 1'b0
+) (
     input wire clk_sys_99_287,
     input wire clk_vid_33_095,
 
     input wire reset,
+    input wire content_reset,
 
     input wire [3:0] cpu_id,
     input wire crt_video,
+    input wire hold_video,
+    input wire crt_source_tick_async,
+    input wire crt_assets_valid,
 
     // Data in
     input wire mask_data_wr,
+    input wire crt_mask_data_wr,
+    input wire crt_mask_data_start,
     input wire [15:0] mask_data,
 
     input wire divider_1khz,
@@ -44,6 +52,12 @@ module video (
     output reg de,
     output wire ce_pix,
     output reg [23:0] rgb,
+    // Coherent logical-pixel stream for the asynchronous 54 MHz output
+    // transport. Bit layout is
+    // {sof, hsync, vsync, hblank, vblank, de, rgb[23:0]}.
+    output reg source_packet_wr = 1'b0,
+    output reg [29:0] source_packet = 30'd0,
+    output wire video_held,
 
     // SDRAM
     input wire sd_data_available,
@@ -54,30 +68,76 @@ module video (
 );
   wire [10:0] video_x;
   wire [9:0] video_y;
-  wire [9:0] next_video_y = video_y >= (crt_video ? 10'd239 : 10'd719) ? 10'd0 : video_y + 10'd1;
-  wire [10:0] source_x = crt_video ? {1'b0, video_x[8:0], 1'b0} : video_x;
-  wire [9:0] source_y = crt_video ? ({video_y[7:0], 1'b0} + video_y) : video_y;
-  wire [9:0] next_source_y = crt_video ? ({next_video_y[7:0], 1'b0} + next_video_y) : source_y;
-  wire [10:0] mask_x = crt_video && hblank_int ? 11'd0 : source_x;
-  wire [9:0] mask_y = crt_video && hblank_int ? next_source_y : source_y;
-  wire [1:0] source_x_step = crt_video ? 2'd2 : 2'd1;
-
+  wire crt_video_pixel;
   wire hsync_int;
   wire vsync_int;
   wire hblank_int;
   wire vblank_int;
-
   wire de_int;
 
-  reg [2:0] ce_counter = 0;
-  wire [2:0] ce_terminal = crt_video ? 3'd4 : 3'd0;
-  assign ce_pix = ce_counter == 3'd0;
+  // The source compositor uses the mapped 98.3203125 MHz PLL net as clk_sys.
+  // Register the next accepted raster coordinate as one atomic packet on every
+  // CE. The LCD mask consumes it one clock later and resolves segment_en on the
+  // following clock, leaving at least a third clock for the completed pixel.
+  // The separate output transport crosses only those completed pixels to the
+  // dedicated 54 MHz CLK_VIDEO domain.
+  reg [10:0] pixel_x_sys = 11'd0;
+  reg [9:0] pixel_y_sys = 10'd0;
+  reg pixel_hblank_sys = 1'b1;
+  reg pixel_vblank_sys = 1'b1;
+  reg pixel_de_sys = 1'b0;
+  reg pixel_crt_sys = 1'b0;
+  reg pixel_packet_ready_sys = 1'b0;
 
-  always @(posedge clk_vid_33_095) begin
-    if (ce_counter == ce_terminal) begin
-      ce_counter <= 3'd0;
+  wire [10:0] packet_total_x = crt_video_pixel ? 11'd429 : 11'd756;
+  wire [9:0] packet_total_y = crt_video_pixel ? 10'd262 : 10'd730;
+  wire [10:0] packet_incremented_x = video_x + 11'd1;
+  wire packet_wrap_x = packet_incremented_x >= packet_total_x;
+  wire [10:0] packet_next_x = packet_wrap_x ? 11'd0 : packet_incremented_x;
+  wire [9:0] packet_incremented_y = video_y + 10'd1;
+  wire [9:0] packet_next_y = packet_wrap_x ?
+      (packet_incremented_y >= packet_total_y ? 10'd0 : packet_incremented_y) :
+      video_y;
+  wire packet_next_hblank = packet_next_x >=
+      (crt_video_pixel ? 11'd360 : 11'd720);
+  wire packet_next_vblank = packet_next_y >=
+      (crt_video_pixel ? 10'd240 : 10'd720);
+  wire packet_next_de = !packet_next_hblank && !packet_next_vblank;
+
+  wire legacy_crt_bridge_sys = pixel_crt_sys && !crt_assets_valid;
+  wire [9:0] next_pixel_y_sys = pixel_y_sys >=
+      (pixel_crt_sys ? 10'd239 : 10'd719) ? 10'd0 : pixel_y_sys + 10'd1;
+  wire [9:0] source_y_sys = legacy_crt_bridge_sys ?
+      ({pixel_y_sys[7:0], 1'b0} + pixel_y_sys) : pixel_y_sys;
+  wire [9:0] next_source_y_sys = legacy_crt_bridge_sys ?
+      ({next_pixel_y_sys[7:0], 1'b0} + next_pixel_y_sys) : next_pixel_y_sys;
+  wire [10:0] source_x_sys = legacy_crt_bridge_sys ?
+      {pixel_x_sys[9:0], 1'b0} : pixel_x_sys;
+  wire [10:0] mask_x_sys = pixel_crt_sys && pixel_hblank_sys ?
+      11'd0 : source_x_sys;
+  wire [9:0] mask_y_sys = pixel_crt_sys && pixel_hblank_sys ?
+      next_source_y_sys : source_y_sys;
+
+  always @(posedge clk_sys_99_287) begin
+    if (reset) begin
+      pixel_packet_ready_sys <= 1'b0;
+      pixel_x_sys <= 11'd0;
+      pixel_y_sys <= 10'd0;
+      pixel_hblank_sys <= 1'b1;
+      pixel_vblank_sys <= 1'b1;
+      pixel_de_sys <= 1'b0;
+      pixel_crt_sys <= 1'b0;
     end else begin
-      ce_counter <= ce_counter + 3'd1;
+      pixel_packet_ready_sys <= 1'b0;
+      if (ce_pix) begin
+        pixel_x_sys <= packet_next_x;
+        pixel_y_sys <= packet_next_y;
+        pixel_hblank_sys <= packet_next_hblank;
+        pixel_vblank_sys <= packet_next_vblank;
+        pixel_de_sys <= packet_next_de;
+        pixel_crt_sys <= crt_video_pixel;
+        pixel_packet_ready_sys <= 1'b1;
+      end
     end
   end
 
@@ -89,11 +149,13 @@ module video (
   lcd lcd (
       .clk(clk_sys_99_287),
 
-      .reset(reset),
+      .reset(content_reset),
 
       .cpu_id(cpu_id),
 
       .mask_data_wr(mask_data_wr),
+      .crt_mask_data_wr(crt_mask_data_wr),
+      .crt_mask_data_start(crt_mask_data_start),
       .mask_data(mask_data),
 
       // Segments
@@ -110,12 +172,21 @@ module video (
       .divider_1khz(divider_1khz),
 
       // Video counters
-      .crt_video(crt_video),
-      .vblank_int(vblank_int),
-      .hblank_int(hblank_int),
-      .video_x(mask_x),
-      .video_y(mask_y),
-      .source_x_step(source_x_step),
+      // crt_video is the stable, sys-controlled active mode and changes only
+      // while raster is held. Use it for preload/bank selection so the 4096
+      // settle interval actually refills the new source before release; packet
+      // x/y/blanking remain atomic raster state.
+      .use_crt_assets(crt_video && crt_assets_valid),
+      .pixel_tick(pixel_packet_ready_sys),
+      // Unlike x/y, this is a preload control. Derive it from the stable
+      // active mode so the mask reader rebases to its legacy x*2 cadence
+      // during HOLD/SETTLE, while pixel_crt_sys is deliberately frozen in the
+      // previous mode until the raster is released.
+      .source_x_step(crt_video && !crt_assets_valid ? 2'd2 : 2'd1),
+      .vblank_int(pixel_vblank_sys),
+      .hblank_int(pixel_hblank_sys),
+      .video_x(mask_x_sys),
+      .video_y(mask_y_sys),
 
       .segment_en(segment_en)
   );
@@ -127,7 +198,7 @@ module video (
   wire [23:0] mask_rgb;
   wire [23:0] processed_rgb;
 
-  wire [7:0] alpha = reset ? 8'h00 : segment_en ? 8'hFF : lcd_off_alpha;
+  wire [7:0] alpha = content_reset ? 8'h00 : segment_en ? 8'hFF : lcd_off_alpha;
 
   alpha_blend alpha_blend (
       .background_pixel(background_rgb),
@@ -136,11 +207,13 @@ module video (
       .output_pixel(processed_rgb)
   );
 
-  wire [2:0] debug_col = video_x[8:6];
-  wire [2:0] debug_row = crt_video ? video_y[7:5] : video_y[8:6];
+`ifdef CORE_ENABLE_DEBUG_OVERLAY
+  wire [2:0] debug_col = crt_video_pixel ? video_x[7:5] : video_x[8:6];
+  wire [2:0] debug_row = crt_video_pixel ? video_y[7:5] : video_y[8:6];
   wire [5:0] debug_idx = {debug_row, debug_col};
-  wire debug_panel = video_x < 11'd512 && video_y < (crt_video ? 10'd240 : 10'd512);
-  wire debug_grid = crt_video ? ((video_x[5:0] == 6'd0) || (video_y[4:0] == 5'd0)) :
+  wire debug_panel = video_x < (crt_video_pixel ? 11'd256 : 11'd512) &&
+      video_y < (crt_video_pixel ? 10'd240 : 10'd512);
+  wire debug_grid = crt_video_pixel ? ((video_x[4:0] == 5'd0) || (video_y[4:0] == 5'd0)) :
       ((video_x[5:0] == 6'd0) || (video_y[5:0] == 6'd0));
 
   reg [63:0] debug_bits;
@@ -176,23 +249,22 @@ module video (
                        24'h080008;
 
   wire [23:0] final_rgb = debug_video ? debug_rgb : processed_rgb;
-
-  always @(posedge clk_sys_99_287) begin
-    // We have two cycles to do work. One is spent on segment_en, one is spent here 
-    rgb <= final_rgb;
-  end
+`else
+  wire [23:0] final_rgb = processed_rgb;
+`endif
 
   rgb_controller rgb_controller (
       .clk_sys_99_287(clk_sys_99_287),
       .clk_vid_33_095(clk_vid_33_095),
 
-      .reset(reset),
+      .reset(content_reset),
 
       // Video
       .ce_pix(ce_pix),
       .crt_video(crt_video),
-      .hblank_int(hblank_int),
-      .video_y(video_y),
+      .use_crt_assets(crt_video && crt_assets_valid),
+      .hblank_int(pixel_hblank_sys),
+      .video_y(pixel_y_sys),
       .de_int(de_int),
 
       // RGB
@@ -210,30 +282,68 @@ module video (
   ////////////////////////////////////////////////////////////////////////////////////////
   // Sync counts
 
-  // Delay all signals by 1 cycle so that RGB is caught up
+  // Retain the source values for the entire CE interval. Framework video
+  // stages sample only on CE_PIXEL, so changing RGB or timing between enables
+  // can otherwise produce scaler-only corruption.
   always @(posedge clk_vid_33_095) begin
-    hsync <= hsync_int;
-    vsync <= vsync_int;
-    hblank <= hblank_int;
-    vblank <= vblank_int;
+    source_packet_wr <= 1'b0;
 
-    de <= de_int;
+    if (ce_pix) begin
+      if (hold_video || video_held) begin
+        hsync <= 1'b0;
+        vsync <= 1'b0;
+        hblank <= 1'b1;
+        vblank <= 1'b1;
+        de <= 1'b0;
+        rgb <= 24'd0;
+      end else begin
+        hsync <= hsync_int;
+        vsync <= vsync_int;
+        hblank <= hblank_int;
+        vblank <= vblank_int;
+        de <= de_int;
+        // Content reset blanks only pixels. Raster/DE remain coherent so the
+        // MiSTer framework can render its OSD before any package is loaded.
+        // The synchronous next-pixel packet gives mask and segments two full
+        // clocks to resolve final_rgb before the next native 3/4-gap CE edge.
+        rgb <= content_reset ? 24'd0 : final_rgb;
+
+        // Register the complete pixel and its timing together. The FIFO sees
+        // source_packet_wr on the following 98.3203125 MHz edge, after this bus
+        // has settled, so no independently synchronized data bits cross to
+        // the 54 MHz transport domain.
+        source_packet <= {
+          video_x == 11'd0 && video_y == 10'd0,
+          hsync_int,
+          vsync_int,
+          hblank_int,
+          vblank_int,
+          de_int,
+          content_reset ? 24'd0 : final_rgb
+        };
+        source_packet_wr <= 1'b1;
+      end
+    end
   end
 
-  counts counts (
-      .clk(clk_vid_33_095),
-      .ce_pix(ce_pix),
-      .crt_video(crt_video),
-
+  video_timing #(
+      .EXTERNAL_CRT_TICK(EXTERNAL_CRT_TICK)
+  ) video_timing (
+      .clk_video(clk_vid_33_095),
+      .reset(reset),
+      .crt_mode_async(crt_video),
+      .hold_async(hold_video),
+      .crt_tick_async(crt_source_tick_async),
       .x(video_x),
       .y(video_y),
-
       .hsync (hsync_int),
       .vsync (vsync_int),
       .hblank(hblank_int),
       .vblank(vblank_int),
-
-      .de(de_int)
+      .de(de_int),
+      .ce_pix(ce_pix),
+      .held(video_held),
+      .crt_mode(crt_video_pixel)
   );
 
 endmodule

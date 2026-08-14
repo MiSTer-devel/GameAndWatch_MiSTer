@@ -14,7 +14,7 @@ use rctree;
 use svg::{self, node::element::tag::Type};
 use tiny_skia_path::Transform;
 
-use crate::{render::ImageDimensions, HEIGHT, WIDTH};
+use crate::render::ImageDimensions;
 
 pub struct RenderedSVG {
     pub pixmap: Pixmap,
@@ -84,9 +84,11 @@ pub fn build_svg(
         }
     }
 
-    let mut id_mask_pixmap = Pixmap::new(WIDTH as u32, HEIGHT as u32).unwrap();
+    let mut id_mask_pixmap =
+        Pixmap::new(dimensions.canvas_width, dimensions.canvas_height).unwrap();
 
-    let mut pixel_pos_to_id: Vec<Option<u16>> = vec![None; WIDTH * HEIGHT];
+    let pixel_count = dimensions.canvas_width as usize * dimensions.canvas_height as usize;
+    let mut pixel_pos_to_id: Vec<Option<u16>> = vec![None; pixel_count];
 
     // Extract pixel to ID mapping
     for (title_tree, id) in title_trees {
@@ -118,7 +120,7 @@ pub fn build_svg(
 
         let pixels = id_mask_pixmap.pixels_mut();
 
-        for i in 0..WIDTH * HEIGHT {
+        for i in 0..pixel_count {
             let pixel = pixels[i];
             if pixel.alpha() == 0 {
                 // Skip this pixel
@@ -144,7 +146,8 @@ pub fn build_svg(
     .expect("Could not render SVG to bitmap");
 
     // This is inefficient, but it transforms the coordinates for us
-    let mut mask_pixmap = Pixmap::new(WIDTH as u32, HEIGHT as u32).unwrap();
+    let mut mask_pixmap =
+        Pixmap::new(dimensions.canvas_width, dimensions.canvas_height).unwrap();
     mask_pixmap.draw_pixmap(
         dimensions.x,
         dimensions.y,

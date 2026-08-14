@@ -2,10 +2,15 @@ set_global_assignment -name QIP_FILE rtl/ip/image_fifo.qip
 set_global_assignment -name QIP_FILE rtl/ip/mask_rom.qip
 
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/types.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/video_pll_54.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/ip/video_packet_fifo.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/video/video_transport_54.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/cpu/divider.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/cpu/instructions.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/input_config.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/hmc_ha1152.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/mask.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/msm6373_sample.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/ram.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/rom_loader.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/sm510.sv
@@ -15,8 +20,16 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/video/lcd.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/video/normalize.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/video/rgb_controller.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/video/segments.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/video/video_timing.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/video/video.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/video_mode_control.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/vendor/sdram-controller/sdram_burst.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/gameandwatch.sv
+set_global_assignment -name SDC_FILE rtl/video_transport.sdc
+
+set_instance_assignment -name PLL_COMPENSATION_MODE DIRECT -to "*video_pll_54:video_pll|altera_pll:video_pll_inst*|*"
+set_instance_assignment -name PLL_CHANNEL_SPACING "0.0 KHz" -to "*video_pll_54:video_pll|altera_pll:video_pll_inst*|*"
+set_instance_assignment -name PLL_AUTO_RESET ON -to "*video_pll_54:video_pll|altera_pll:video_pll_inst*|*"
+set_instance_assignment -name PLL_BANDWIDTH_PRESET AUTO -to "*video_pll_54:video_pll|altera_pll:video_pll_inst*|*"
 
 set_global_assignment -name SYSTEMVERILOG_FILE GameAndWatch.sv

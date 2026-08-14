@@ -8,7 +8,9 @@ scaler
 hps_isw_handoff
 vip
 Lite Builds
-*_sim
+sim
+tmp
+snap
 .qsys_edit
 PLLJ_PLLSPE_INFO.txt
 *.bak

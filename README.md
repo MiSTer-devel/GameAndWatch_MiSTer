@@ -18,7 +18,29 @@ Release RBFs should be placed in `releases/` with MiSTer naming:
 GameAndWatch_YYYYMMDD.rbf
 ```
 
-Migration details and verification notes were written by Codex are documented in [docs/mister_migration.md](docs/mister_migration.md).
+Migration details and verification notes are documented in [docs/mister_migration.md](docs/mister_migration.md).
+
+The current source uses a dedicated 54.000 MHz `CLK_VIDEO` and emits an actual
+360x240 analog-facing raster at a 6.750 MHz `CE_PIXEL` cadence. CRT sync,
+blanking, DE, and its 429x262 raster continue through packet-FIFO
+search/recovery; only unavailable RGB is blacked. The output transport requests
+each CRT source pixel and holds a recovered source SOF until the next local
+frame boundary, so the two clock domains cannot resume at mismatched raster
+coordinates.
+
+The current release-style artifact is
+`releases/GameAndWatch_20260813_nodebug_timing.rbf`: 3,488,500 bytes, SHA-256
+`5F38DEB3152B422E2D999A02AB0F4E50DE7DEB3572834073D74FB45AA059E14B`.
+Normal builds leave `CORE_ENABLE_DEBUG_OVERLAY` undefined, removing the debug
+menu entries, capture state, and pixel grid. The fixed-54 video domain has
+`+8.155 ns` setup slack and its transport/CDC audit is clean. The 98.3203125 MHz
+core domain is within the project's accepted one-nanosecond floor at
+`-0.605 ns` worst setup slack and `-1.917 ns` TNS, although this is not strict
+zero-slack timing closure. The previous request-locked artifact remains the
+hardware-smoked build: with Direct Video disabled, nine USB-2 Star Fox
+screenshots captured every four seconds were byte-identical at 360x240. The new
+debug-free artifact has not yet been deployed or hardware-smoked. Morph/analog
+lock and audible sound quality remain user-observed hardware checks.
 
 ## Installation Instructions
 
@@ -26,24 +48,41 @@ See [Platform Installation Instructions](docs/platform_installation.md) for plat
 
 ## Generating ROMs
 
-MiSTer loads `.gnw` ROM packages through the OSD. The ROM generator source and manifest extractor live in [rom generator/](rom%20generator/); full usage notes are in [docs/rom_generator.md](docs/rom_generator.md).
+MiSTer loads `.gnw` ROM packages through the OSD. The ROM generator source and manifest extractor live in [rom generator/](rom%20generator/); full usage notes are in [docs/rom_generator.md](docs/rom_generator.md). Current packages contain native artwork and LCD-mask payloads for both the default CRT-friendly `360x240` mode and the selectable `720x720` mode. The regenerated 168-package set has passed full-directory validation and is present in the repository `roms/` baseline.
 
 ## Supported Systems
 
-The Game and Watch (and related) series of devices used varied hardware for each device. The currently supported CPUs are:
-* SM510 - The "base" CPU the other's were based off of - Donkey Kong, Fire Attack, Mickey and Donald, etc
-* SM511 - Later Game & Watch titles with a dedicated melody ROM - Super Mario Bros., Climber, Balloon Fight, etc
-* SM512 - Later Multi Screen titles with an added C segment group - Black Jack, Bomb Sweeper, Gold Cliff, Zelda, etc
-* SM530 - Nelsonic Game Watch titles with SM500-style LCD outputs and a dedicated melody ROM - Super Mario Bros. 3, Super Mario World, Star Fox, etc
-* SM510 (Tiger Variant) - Experimental - Street Fighter 2, Double Dragon, etc
-* SM5a - Ball, Octopus, etc
+The Game and Watch (and related) series used several CPU variants. The currently supported CPUs are:
+
+- SM510 - the base CPU used by Donkey Kong, Fire Attack, Mickey and Donald, and others
+- SM511 - later Game & Watch titles with a dedicated melody ROM, including Super Mario Bros., Climber, and Balloon Fight
+- SM512 - later Multi Screen titles with an added C segment group, including Black Jack, Bomb Sweeper, Gold Cliff, and Zelda
+- SM530 - Nelsonic Game Watch titles with SM500-style LCD outputs and a dedicated melody ROM, including Super Mario Bros. 3, Super Mario World, and Star Fox
+- SM510 Tiger variant - Street Fighter II, Double Dragon, and others
+- SM511 Tiger 1-bit and 2-bit variants - later Tiger melody/sound hardware
+- SM5a - Ball, Octopus, and others
 
 The [ROM Generator](docs/rom_generator.md) will read the attached `manifest.json` file to determine what CPU is used by each game. You can manually look through this file yourself, or use the generator tool to determine if a game is supported at this time.
 
 
 ### Input Limitations
 
-The MiSTer core is built around the controller mapping shown in the OSD. Games whose original hardware depends on a keyboard or calculator-style keypad matrix are not currently supported, even if the CPU and ROM package load correctly. These packages may boot, play sound, or show static artwork but will not be playable until a preservation-friendly input mapping is designed.
+The 168-title MAME 0.289-derived supported set, including two retained homebrew entries, fits a four-direction D-pad plus ten buttons. The package selects the appropriate meaning for each stable MiSTer position:
+
+| Physical position | Package-selected function |
+| --- | --- |
+| D-pad | Main/left joystick directions |
+| Buttons 1-4 | Buttons 1-4 or right joystick Down/Right/Left/Up |
+| System 1 | Time / Pause / Status |
+| System 2 | Alarm |
+| System 3 | Game A / Power On |
+| System 4 | Game B / Power Off |
+| System 5 | Sound / Minute |
+| System 6 | ACL (All Clear) |
+
+These pairings are mutually exclusive within every supported package; the largest games occupy nine of the ten buttons. The first eight button positions retain their legacy order, while Sound/Minute and ACL are appended and require an explicit controller binding. Input is suppressed while the MiSTer OSD is open.
+
+Games whose original hardware depends on a keyboard, calculator-style keypad matrix, or dial are not currently supported. The Micro Vs. titles `gnw_boxing`, `gnw_dkong3`, and `gnw_dkhockey` carry per-input player ownership in current packages and use MiSTer's independent player-one and player-two controller buses. Older packages without that metadata retain their legacy one-controller behavior.
 
 ### Homebrew
 
@@ -53,16 +92,20 @@ Squeeze does not run correctly due to having a completely different artwork desi
 
 ## Features
 
-* 720 x 720 pixel resolution
+* CRT-friendly `360x240` native video by default, with live switching to `720x720`
+* Generator-native artwork and LCD masks for both resolutions in each current package
+* Independent two-player controls for Boxing, Donkey Kong 3, and Donkey Kong Hockey
+* Trace-matched HA1152/HMC sound effects for Nelsonic Star Fox using its dumped 128-byte effect ROM
+* Sample-backed MSM6373 voice support for Star Trek, Teenage Mutant Ninja Turtles II, and Top Gun
 * Ability to show inactive LCD segments with configurable opacity
 * Deflicker on the LCD
 * VSync after the deflicker has taken place
 
 ## Settings
 
-* `Show Inactive LCD` - LCD segments that are inactive (off) remain displayed. See `Inact. LCD Alpha`
-* `Inact. LCD Alpha` - `Inactive LCD Alpha` - If `Show Inactive LCD` is on (or this setting is set on MiSTer), sets the opacity of the disabled segments. Defaults to approximately 5%, or 13/255.
-* `Acc. LCD Timing` - `Accurate LCD timing` - By default, the Game and Watch's LCD pulses at 64hz, which is what drives the static LCD screen. However, due to lack of persistence of our modern LCDs, this just results in a bunch of flicker. Instead when this setting is disabled, the LCD data will be updated at 1000 Hz. Enabling this setting updates the LCD at 64 Hz.
+* `Native Video` - selects `360x240 CRT` (the default 4:3 presentation) or `720x720` (1:1). Current dual-resolution packages switch image and LCD-mask banks with the timing mode; older packages use a compatibility bridge in CRT mode.
+* `Inact. LCD Alpha` - sets the opacity of inactive LCD segments from Off (the default) through 100%.
+* `Acc. LCD Timing` - uses the original 64 Hz LCD update behavior when enabled. The default 1 kHz update avoids visible flicker on modern displays.
 
 ## Core Docs
 

@@ -1,17 +1,54 @@
 use std::{collections::HashSet, path::Path};
 
 use image::{imageops::FilterType, DynamicImage, ImageBuffer, Rgba};
-use resvg::tiny_skia::{Pixmap, PixmapPaint, PremultipliedColorU8};
+use resvg::tiny_skia::{FilterQuality, Pixmap, PixmapPaint, PremultipliedColorU8};
 use tiny_skia_path::Transform;
 
 use crate::{
     layout::{
-        BlendType, Bounds, Element, MameLayout, NameElementChildren, Screen, View, ViewElement,
+        BlendType, Bounds, Element, Image as LayoutImage, MameLayout, NameElement,
+        NameElementChildren, NativeScreenSize, Screen, View, ViewElement,
     },
     manifest::{self, PlatformSpecification, PresetDefinition},
     svg_manage::build_svg,
-    HEIGHT, WIDTH,
 };
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RenderTarget {
+    pub output_width: usize,
+    pub output_height: usize,
+    pub logical_width: usize,
+    pub logical_height: usize,
+    pub debug_suffix: &'static str,
+}
+
+impl RenderTarget {
+    pub const fn native() -> Self {
+        Self {
+            output_width: 720,
+            output_height: 720,
+            logical_width: 720,
+            logical_height: 720,
+            debug_suffix: "",
+        }
+    }
+
+    pub const fn crt() -> Self {
+        Self {
+            output_width: 360,
+            output_height: 240,
+            // Lay the artwork out on a square-pixel 4:3 canvas first, then
+            // expand the complete composition into the 360-sample transport.
+            logical_width: 320,
+            logical_height: 240,
+            debug_suffix: "_crt",
+        }
+    }
+
+    fn logical_pixel_count(self) -> usize {
+        self.logical_width * self.logical_height
+    }
+}
 
 pub struct RenderedData {
     pub background_bytes: Pixmap,
@@ -25,8 +62,18 @@ pub fn render(
     layout_manifest: &MameLayout,
     platform: &PlatformSpecification,
     asset_dir: &Path,
+    target: RenderTarget,
     debug: bool,
 ) -> Result<RenderedData, String> {
+    if target.output_width == 0
+        || target.output_height == 0
+        || target.logical_width == 0
+        || target.logical_height == 0
+    {
+        return Err("Render target dimensions must be nonzero".to_string());
+    }
+
+    let native_screen_sizes = native_screen_sizes(&platform.device.screen);
     let mut view_bounds: Option<Bounds> = None;
     let mut elements: Vec<&Element> = vec![];
     let mut screens: Vec<&Screen> = vec![];
@@ -91,7 +138,8 @@ pub fn render(
 
     // Calculate max bounds
     // Only Element nodes are used, as Screen's should not drive the overall picture size (they sometimes overrun it)
-    for bounds in elements.iter().map(|e| e.bounds.to_xy()) {
+    for element in &elements {
+        let bounds = element.bounds.to_xy(&native_screen_sizes)?;
         if let Some(inner_min_x) = min_x {
             if inner_min_x > bounds.x {
                 min_x = Some(bounds.x);
@@ -143,8 +191,15 @@ pub fn render(
         height: max_height - max_common_y,
     };
 
-    let x_ratio = WIDTH as f32 / view_bounds.width as f32;
-    let y_ratio = HEIGHT as f32 / view_bounds.height as f32;
+    if view_bounds.width <= 0 || view_bounds.height <= 0 {
+        return Err(format!(
+            "View {} in {platform_name} has invalid bounds {view_bounds:?}",
+            layout.name
+        ));
+    }
+
+    let x_ratio = target.logical_width as f32 / view_bounds.width as f32;
+    let y_ratio = target.logical_height as f32 / view_bounds.height as f32;
 
     let (ratio, x_scale) = if x_ratio < y_ratio {
         // Scaling based on X
@@ -155,64 +210,52 @@ pub fn render(
 
     let (x_offset, y_offset) = if !x_scale {
         let scaled_width = view_bounds.width as f32 * ratio;
-        ((WIDTH as i32 - scaled_width.round() as i32) / 2, 0)
+        (
+            (target.logical_width as i32 - scaled_width.round() as i32) / 2,
+            0,
+        )
     } else {
         let scaled_height = view_bounds.height as f32 * ratio;
-        (0, (HEIGHT as i32 - scaled_height.round() as i32) / 2)
+        (
+            0,
+            (target.logical_height as i32 - scaled_height.round() as i32) / 2,
+        )
     };
 
     // Keep track of the set of pixels that make up each screen
-    let mut pixels_to_mask_id: Vec<Option<u16>> = vec![None; WIDTH * HEIGHT];
+    let mut pixels_to_mask_id: Vec<Option<u16>> = vec![None; target.logical_pixel_count()];
 
-    let mut background_pixmap = Pixmap::new(WIDTH as u32, HEIGHT as u32).unwrap();
-    let mut mask_pixmap = Pixmap::new(WIDTH as u32, HEIGHT as u32).unwrap();
+    let mut background_pixmap =
+        Pixmap::new(target.logical_width as u32, target.logical_height as u32).unwrap();
+    let mut mask_pixmap =
+        Pixmap::new(target.logical_width as u32, target.logical_height as u32).unwrap();
 
     // We currently ignore offsetting by X/Y at the parent view, so the child positions are subtracted
     // from the parent's offset
     for item in &filtered_items {
         match item {
             ViewElement::Element(element) | ViewElement::Overlay(element) => {
-                if layout_manifest
+                let layout_element = layout_manifest
                     .element
                     .iter()
-                    .find(|e| {
-                        e.name == element.ref_name
-                            && e.items
-                                .iter()
-                                .find(|p| {
-                                    if let NameElementChildren::Image(_) = **p {
-                                        true
-                                    } else {
-                                        false
-                                    }
-                                })
-                                .is_some()
-                    })
-                    .is_none()
-                {
+                    .find(|candidate| candidate.name == element.ref_name);
+
+                let Some(layout_image) = layout_element.and_then(select_element_image) else {
                     // There is no defined element with this name OR the defined element does not have image data
                     // Skip
                     continue;
-                }
+                };
 
-                let file_path = asset_dir
-                    .join("foo")
-                    .with_file_name(format!("{}.png", element.ref_name));
+                let file_path = asset_dir.join(&layout_image.file);
 
-                // A bug in either tiny_skia or image prevents transparency from working correctly when imported
-                // through image, so we import in tiny_skia and convert
-                guard!(let Ok(image) = Pixmap::load_png(&file_path) else {
-                    return Err(format!("Missing element asset \"{}\" which was not at {file_path:?}", element.ref_name));
-                });
+                let image = load_element_image(&file_path).map_err(|error| {
+                    format!(
+                        "Could not load element asset \"{}\" from {file_path:?}: {error}",
+                        element.ref_name
+                    )
+                })?;
 
-                let image = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_vec(
-                    image.width(),
-                    image.height(),
-                    image.take(),
-                )
-                .expect("Could not convert image data");
-
-                let element_bounds = element.bounds.to_xy();
+                let element_bounds = element.bounds.to_xy(&native_screen_sizes)?;
 
                 let x = if element_bounds.x >= 0 {
                     // Only normalize to 0 if we started out positive
@@ -235,8 +278,14 @@ pub fn render(
                     height: element_bounds.height,
                 };
 
-                let dimensions =
-                    ImageDimensions::new(&view_bounds, &element_bounds, ratio, x_offset, y_offset);
+                let dimensions = ImageDimensions::new(
+                    &view_bounds,
+                    &element_bounds,
+                    ratio,
+                    x_offset,
+                    y_offset,
+                    target,
+                );
 
                 let image: DynamicImage = DynamicImage::ImageRgba8(image).resize_exact(
                     dimensions.width,
@@ -255,7 +304,11 @@ pub fn render(
                     return Err(format!("Could not convert PNG into Pixmap"));
                 });
 
-                let mut aligned_image_pixmap = Pixmap::new(WIDTH as u32, HEIGHT as u32).unwrap();
+                let mut aligned_image_pixmap = Pixmap::new(
+                    target.logical_width as u32,
+                    target.logical_height as u32,
+                )
+                .unwrap();
 
                 // This is inefficient, but I don't want to calculate the bounds changes
                 aligned_image_pixmap.draw_pixmap(
@@ -284,7 +337,7 @@ pub fn render(
                 let pixels = aligned_image_pixmap.pixels();
                 let mask_pixels = mask_pixmap.pixels_mut();
                 let background_pixels = background_pixmap.pixels_mut();
-                for i in 0..WIDTH * HEIGHT {
+                for i in 0..target.logical_pixel_count() {
                     let pixel = pixels[i];
                     if pixel.alpha() == 0 {
                         continue;
@@ -318,15 +371,19 @@ pub fn render(
                     &platform.device,
                 ));
 
-                let alternate_file_path = platform.rom.rom_owner.as_ref().and_then(|parent| {
-                    Some(asset_dir.join("foo").with_file_name(screen_filename(
-                        screen.index as usize,
-                        &parent,
-                        &platform.device,
-                    )))
-                });
+                let alternate_file_path = platform
+                    .parent
+                    .as_ref()
+                    .or(platform.rom.rom_owner.as_ref())
+                    .map(|parent| {
+                        asset_dir.join("foo").with_file_name(screen_filename(
+                            screen.index as usize,
+                            parent,
+                            &platform.device,
+                        ))
+                    });
 
-                let bounds = screen.bounds.to_xy();
+                let bounds = screen.bounds.to_xy(&native_screen_sizes)?;
 
                 let x = if bounds.x >= 0 {
                     // Only normalize to 0 if we started out positive
@@ -349,8 +406,14 @@ pub fn render(
                     height: bounds.height,
                 };
 
-                let dimensions =
-                    ImageDimensions::new(&view_bounds, &bounds, ratio, x_offset, y_offset);
+                let dimensions = ImageDimensions::new(
+                    &view_bounds,
+                    &bounds,
+                    ratio,
+                    x_offset,
+                    y_offset,
+                    target,
+                );
 
                 // TODO: We don't really have a way to scale SVGs that won't result in a quality loss
                 // so that isn't handled here
@@ -369,7 +432,7 @@ pub fn render(
 
                 // Combine this screen into the global pixel ID map
                 // If both have IDs, latest wins
-                for i in 0..WIDTH * HEIGHT {
+                for i in 0..target.logical_pixel_count() {
                     if let Some(new_svg_id) = rendered_svg.pixel_pos_to_id[i] {
                         // Use this, replacing any existing pixel
                         pixels_to_mask_id[i] = Some(new_svg_id);
@@ -394,12 +457,32 @@ pub fn render(
 
     ensure_lcd_contrast(&mut output_mask, &background_pixmap, &pixels_to_mask_id);
 
-    if debug {
-        let debug_path = asset_dir.join(format!("{platform_name}.png"));
-        let debug_background_path = asset_dir.join(format!("{platform_name}_background.png"));
-        let debug_mask_path = asset_dir.join(format!("{platform_name}_mask.png"));
+    // Author CRT artwork on an effective square-pixel 320x240 canvas, then
+    // expand the complete composition into the 360-sample transport. resvg
+    // preserves SVG aspect ratio inside its render target, so stretching only
+    // element rectangles would leave LCD content narrow while raster artwork
+    // filled the output width.
+    let background_pixmap = expand_pixmap(&background_pixmap, target);
+    let mask_pixmap = expand_pixmap(&mask_pixmap, target);
+    let output_mask = expand_pixmap(&output_mask, target);
+    let pixels_to_mask_id = expand_mask_ids(&pixels_to_mask_id, target);
 
-        let mut debug_pixmap = Pixmap::new(WIDTH as u32, HEIGHT as u32).unwrap();
+    if debug {
+        let debug_path = asset_dir.join(format!(
+            "{platform_name}{}.png",
+            target.debug_suffix
+        ));
+        let debug_background_path = asset_dir.join(format!(
+            "{platform_name}{}_background.png",
+            target.debug_suffix
+        ));
+        let debug_mask_path = asset_dir.join(format!(
+            "{platform_name}{}_mask.png",
+            target.debug_suffix
+        ));
+
+        let mut debug_pixmap =
+            Pixmap::new(target.output_width as u32, target.output_height as u32).unwrap();
 
         debug_pixmap.draw_pixmap(
             0,
@@ -431,6 +514,82 @@ pub fn render(
     })
 }
 
+fn native_screen_sizes(screen: &manifest::Screen) -> Vec<NativeScreenSize> {
+    let size = |width, height| NativeScreenSize { width, height };
+
+    match screen {
+        manifest::Screen::Single { width, height } => vec![size(*width, *height)],
+        manifest::Screen::DualVertical { top, bottom } => vec![
+            size(top.width, top.height),
+            size(bottom.width, bottom.height),
+        ],
+        manifest::Screen::DualHorizontal { left, right } => vec![
+            size(left.width, left.height),
+            size(right.width, right.height),
+        ],
+        manifest::Screen::TripleHorizontal {
+            left,
+            middle,
+            right,
+        } => vec![
+            size(left.width, left.height),
+            size(middle.width, middle.height),
+            size(right.width, right.height),
+        ],
+    }
+}
+
+fn select_element_image(element: &NameElement) -> Option<&LayoutImage> {
+    let images: Vec<&LayoutImage> = element
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            NameElementChildren::Image(image) => Some(image),
+            NameElementChildren::Rect(_) => None,
+        })
+        .collect();
+
+    if let Some(default_state) = element.defstate {
+        if let Some(image) = images
+            .iter()
+            .find(|image| image.state == Some(default_state))
+        {
+            return Some(*image);
+        }
+    }
+
+    images
+        .iter()
+        .find(|image| image.state.is_none())
+        .copied()
+        .or_else(|| images.first().copied())
+}
+
+fn load_element_image(file_path: &Path) -> Result<ImageBuffer<Rgba<u8>, Vec<u8>>, String> {
+    let is_png = file_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.eq_ignore_ascii_case("png"))
+        .unwrap_or(false);
+
+    if is_png {
+        // Preserve the existing tiny-skia PNG path, which handles alpha in the
+        // same premultiplied representation used by the compositor.
+        if let Ok(image) = Pixmap::load_png(file_path) {
+            return ImageBuffer::<Rgba<u8>, Vec<u8>>::from_vec(
+                image.width(),
+                image.height(),
+                image.take(),
+            )
+            .ok_or_else(|| "could not convert PNG pixel data".to_string());
+        }
+    }
+
+    image::open(file_path)
+        .map(|image| image.to_rgba8())
+        .map_err(|error| error.to_string())
+}
+
 fn ensure_lcd_contrast(
     output_mask: &mut Pixmap,
     background_pixmap: &Pixmap,
@@ -438,11 +597,13 @@ fn ensure_lcd_contrast(
 ) {
     let background_pixels = background_pixmap.pixels();
     let mask_pixels = output_mask.pixels();
+    debug_assert_eq!(pixels_to_mask_id.len(), background_pixels.len());
+    debug_assert_eq!(pixels_to_mask_id.len(), mask_pixels.len());
 
     let mut segment_pixels = 0usize;
     let mut total_delta = 0usize;
 
-    for i in 0..WIDTH * HEIGHT {
+    for i in 0..pixels_to_mask_id.len() {
         if pixels_to_mask_id[i].is_none() {
             continue;
         }
@@ -469,7 +630,7 @@ fn ensure_lcd_contrast(
 
     let mask_pixels = output_mask.pixels_mut();
 
-    for i in 0..WIDTH * HEIGHT {
+    for i in 0..pixels_to_mask_id.len() {
         if pixels_to_mask_id[i].is_none() {
             continue;
         }
@@ -565,6 +726,8 @@ pub struct ImageDimensions {
     pub y: i32,
     pub width: u32,
     pub height: u32,
+    pub canvas_width: u32,
+    pub canvas_height: u32,
 }
 
 impl ImageDimensions {
@@ -574,6 +737,7 @@ impl ImageDimensions {
         ratio: f32,
         x_offset: i32,
         y_offset: i32,
+        target: RenderTarget,
     ) -> Self {
         let x = ((bounds.x as i32 - view_bounds.x as i32) as f32 * ratio).round() as i32;
         let y = ((bounds.y as i32 - view_bounds.y as i32) as f32 * ratio).round() as i32;
@@ -593,6 +757,154 @@ impl ImageDimensions {
             y: y + y_offset,
             width,
             height,
+            canvas_width: target.logical_width as u32,
+            canvas_height: target.logical_height as u32,
         }
+    }
+}
+
+fn expand_pixmap(source: &Pixmap, target: RenderTarget) -> Pixmap {
+    if target.logical_width == target.output_width
+        && target.logical_height == target.output_height
+    {
+        return source.clone();
+    }
+
+    let mut output = Pixmap::new(target.output_width as u32, target.output_height as u32)
+        .expect("Could not allocate expanded render target");
+    let mut paint = PixmapPaint::default();
+    paint.quality = FilterQuality::Bicubic;
+    output.draw_pixmap(
+        0,
+        0,
+        source.as_ref(),
+        &paint,
+        Transform::from_scale(
+            target.output_width as f32 / target.logical_width as f32,
+            target.output_height as f32 / target.logical_height as f32,
+        ),
+        None,
+    );
+    output
+}
+
+fn expand_mask_ids(source: &[Option<u16>], target: RenderTarget) -> Vec<Option<u16>> {
+    debug_assert_eq!(source.len(), target.logical_pixel_count());
+    if target.logical_width == target.output_width
+        && target.logical_height == target.output_height
+    {
+        return source.to_vec();
+    }
+
+    let mut output = vec![None; target.output_width * target.output_height];
+    for output_y in 0..target.output_height {
+        let source_y = (((output_y as f64 + 0.5) * target.logical_height as f64
+            / target.output_height as f64)
+            .floor() as usize)
+            .min(target.logical_height - 1);
+        for output_x in 0..target.output_width {
+            let source_x = (((output_x as f64 + 0.5) * target.logical_width as f64
+                / target.output_width as f64)
+                .floor() as usize)
+                .min(target.logical_width - 1);
+            output[output_y * target.output_width + output_x] =
+                source[source_y * target.logical_width + source_x];
+        }
+    }
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn layout_image(file: &str, state: Option<i32>) -> NameElementChildren {
+        NameElementChildren::Image(LayoutImage {
+            file: file.to_string(),
+            state,
+        })
+    }
+
+    #[test]
+    fn selects_the_element_default_state_image() {
+        let element = NameElement {
+            name: "background".to_string(),
+            defstate: Some(2),
+            items: vec![
+                layout_image("state-1.png", Some(1)),
+                layout_image("state-2.jpg", Some(2)),
+            ],
+        };
+
+        assert_eq!(
+            select_element_image(&element).map(|image| image.file.as_str()),
+            Some("state-2.jpg")
+        );
+    }
+
+    #[test]
+    fn prefers_a_stateless_image_when_the_default_state_is_missing() {
+        let element = NameElement {
+            name: "background".to_string(),
+            defstate: Some(2),
+            items: vec![
+                layout_image("state-1.png", Some(1)),
+                layout_image("background.jpg", None),
+            ],
+        };
+
+        assert_eq!(
+            select_element_image(&element).map(|image| image.file.as_str()),
+            Some("background.jpg")
+        );
+    }
+
+    #[test]
+    fn crt_target_lays_out_on_square_pixel_320x240_canvas() {
+        let view = Bounds {
+            x: 0,
+            y: 0,
+            width: 320,
+            height: 240,
+        };
+        let right_half = Bounds {
+            x: 160,
+            y: 0,
+            width: 160,
+            height: 240,
+        };
+        let dimensions = ImageDimensions::new(
+            &view,
+            &right_half,
+            1.0,
+            0,
+            0,
+            RenderTarget::crt(),
+        );
+
+        assert_eq!(dimensions.x, 160);
+        assert_eq!(dimensions.y, 0);
+        assert_eq!(dimensions.width, 160);
+        assert_eq!(dimensions.height, 240);
+        assert_eq!(dimensions.canvas_width, 320);
+        assert_eq!(dimensions.canvas_height, 240);
+    }
+
+    #[test]
+    fn crt_expansion_maps_the_complete_composition_to_360_samples() {
+        let target = RenderTarget::crt();
+        let mut ids = vec![None; target.logical_pixel_count()];
+        ids[160] = Some(0x155);
+
+        let expanded = expand_mask_ids(&ids, target);
+        assert_eq!(expanded.len(), 360 * 240);
+        assert_eq!(expanded[179], None);
+        assert_eq!(expanded[180], Some(0x155));
+        assert_eq!(expanded[181], None);
+
+        let source = Pixmap::new(320, 240).unwrap();
+        let expanded_pixmap = expand_pixmap(&source, target);
+        assert_eq!(expanded_pixmap.width(), 360);
+        assert_eq!(expanded_pixmap.height(), 240);
     }
 }

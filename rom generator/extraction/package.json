@@ -5,7 +5,9 @@
   "main": "index.js",
   "scripts": {
     "build": "ts-node src/extract.ts",
-    "extract": "ts-node src/extract.ts"
+    "extract": "ts-node src/extract.ts",
+    "test": "ts-node src/mame/roms.test.ts && ts-node src/mame/inputs.test.ts",
+    "typecheck": "tsc --noEmit"
   },
   "author": "agg23",
   "license": "MIT",

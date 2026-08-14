@@ -8,6 +8,40 @@ pub struct PlatformSpecification {
     pub port_map: PlatformPortMapping,
     pub metadata: Metdata,
     pub rom: ROMName,
+    pub parent: Option<String>,
+    pub unsupported_reason: Option<String>,
+    pub voice: Option<VoiceDefinition>,
+    pub aux_rom: Option<AuxROMDefinition>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceDefinition {
+    pub sample_set: String,
+    pub commands: Vec<Option<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuxROMDefinition {
+    #[serde(rename = "type")]
+    pub rom_type: AuxROMType,
+    pub region: AuxROMRegion,
+    pub rom: String,
+    pub size: usize,
+    pub rom_hash: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+pub enum AuxROMType {
+    #[serde(rename = "ha1152")]
+    HA1152,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum AuxROMRegion {
+    Sfx,
 }
 
 /* ROM */
@@ -121,6 +155,7 @@ pub struct NamedAction {
     pub action: Action,
     pub active_low: bool,
     pub name: Option<String>,
+    pub player: Option<u8>,
 }
 
 #[derive(PartialEq, Clone, Debug, Deserialize)]
@@ -158,5 +193,8 @@ pub enum Action {
     Custom,
     CustomUpDown,
     CustomButtonHour,
+    Dial,
+    Service3,
+    Service4,
     Unused,
 }

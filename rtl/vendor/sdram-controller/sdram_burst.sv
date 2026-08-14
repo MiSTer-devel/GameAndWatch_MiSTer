@@ -181,6 +181,7 @@ module sdram_burst #(
 
   localparam COLUMN_BITS_16 = {{(16 - SETTING_COLUMN_BITS) {1'b0}}, {SETTING_COLUMN_BITS{1'b1}}};
 
+  reg [15:0] refresh_counter = 0;
   wire [15:0] burst_refresh_amount = refresh_counter + COLUMN_BITS_16 + 16'h10;
 
   wire [2:0] concrete_burst_length = 3'h7;
@@ -224,9 +225,6 @@ module sdram_burst #(
   reg [31:0] delay_counter = 0;
   // The number of words we're reading
   reg [3:0] read_counter = 0;
-
-  // Measures when auto refresh needs to be triggered
-  reg [15:0] refresh_counter = 0;
 
   reg [1:0] active_port = 0;
 
@@ -344,8 +342,14 @@ module sdram_burst #(
 
   assign p0_available = state == IDLE && ~port_req;
 
-  wire next_cycle_is_read = state == DELAY && delay_state == READ_OUTPUT && delay_counter == 0;
-  assign p0_data_available = next_cycle_is_read || state == READ_OUTPUT || extra_burst_data_cycles > 0;
+  // Register the one-cycle lookahead rather than decoding the 32-bit delay
+  // counter directly onto the client data path. When DELAY decrements 1->0,
+  // this flag rises for the following counter-zero cycle, exactly matching
+  // the former combinational `next_cycle_is_read` window. READ_OUTPUT and its
+  // CAS-latency tail retain their original level-sensitive behavior.
+  reg read_data_lookahead = 0;
+  assign p0_data_available =
+      read_data_lookahead || state == READ_OUTPUT || extra_burst_data_cycles > 0;
 
   ////////////////////////////////////////////////////////////////////////////////////////
   // Process
@@ -372,7 +376,11 @@ module sdram_burst #(
       p0_rd_queue <= 0;
 
       dq_output <= 0;
+      read_data_lookahead <= 0;
     end else begin
+      read_data_lookahead <=
+          state == DELAY && delay_state == READ_OUTPUT && delay_counter == 1;
+
       needs_refresh <= refresh_counter >= CYCLES_PER_REFRESH[15:0];
       needs_burst_refresh <= burst_refresh_amount >= CYCLES_PER_REFRESH[15:0];
 

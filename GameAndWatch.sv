@@ -83,14 +83,16 @@ module emu (
     "O[5:2],Inactive LCD Alpha,Off,5%,10%,20%,30%,40%,50%,60%,70%,80%,90%,100%;",
     "-;",
     "O[1],Accurate LCD Timing,Off,On;",
+`ifdef CORE_ENABLE_DEBUG_OVERLAY
     "-;",
     "O[6],Debug Video,Off,On;",
     "O[8:7],Debug View,Events,CPU,Melody,Core;",
     "O[9],Debug Freeze,Off,On;",
     "-;",
+`endif
     "-;",
     "R[0],Reset;",
-    "J1,Btn 1/R Joy Down,Btn 2/R Joy Right,Btn 3/R Joy Left,Btn 4/R Joy Up,Time,Alarm,Game A,Game B;",
+    "J1,Btn 1/R Joy Down,Btn 2/R Joy Right,Btn 3/R Joy Left,Btn 4/R Joy Up,Time/Pause/Status,Alarm,Game A/Power On,Game B/Power Off,Sound/Minute,ACL;",
     "jn,B,A,Y,X,L,R,Select,Start;",
     "v,0;",
     "V,v",
@@ -98,17 +100,57 @@ module emu (
   };
 
   wire clk_sys_99_287;
-  wire clk_vid_33_095;
   wire pll_core_locked;
-  wire clk_video = clk_vid_33_095;
+  wire clk_video_54;
+  wire pll_video_locked;
 
   pll pll (
       .refclk  (CLK_50M),
       .rst     (RESET),
       .outclk_0(clk_sys_99_287),
-      .outclk_1(clk_vid_33_095),
+      .outclk_1(),
       .locked  (pll_core_locked)
   );
+
+  // Direct Video transports the CRT raster on the canonical 54.000 MHz SD
+  // clock. Rendering remains on the mapped 98.3203125 MHz core clock below; a
+  // packet FIFO crosses only complete logical pixels into this output domain.
+  // The video PLL is free-running. Its lock participates in the transport's
+  // asynchronously asserted, synchronously released reset instead of being
+  // restarted by the emulated machine reset.
+  video_pll_54 video_pll (
+      .refclk_50  (CLK_50M),
+      .reset      (1'b0),
+      .clk_video_54(clk_video_54),
+      .locked     (pll_video_locked)
+  );
+
+  wire video_transport_async_reset = RESET || !pll_core_locked || !pll_video_locked;
+  (* altera_attribute = "-name SYNCHRONIZER_IDENTIFICATION FORCED_IF_ASYNCHRONOUS" *)
+  reg [2:0] video_transport_reset_pipe = 3'b111;
+  always @(posedge clk_video_54 or posedge video_transport_async_reset) begin
+    if (video_transport_async_reset) begin
+      video_transport_reset_pipe <= 3'b111;
+    end else begin
+      video_transport_reset_pipe <= {video_transport_reset_pipe[1:0], 1'b0};
+    end
+  end
+  wire video_transport_reset = video_transport_reset_pipe[2];
+
+  wire active_crt_video;
+  wire hold_video;
+  wire new_vmode;
+  wire transport_active_crt;
+
+  // video_mode_control emits a toggle only after a mode switch has completed
+  // in the source domain. Synchronize that notification before handing it to
+  // hps_io's fixed-54 MHz video-domain mode calculator.
+  (* altera_attribute = "-name SYNCHRONIZER_IDENTIFICATION FORCED_IF_ASYNCHRONOUS" *)
+  reg [1:0] new_vmode_video_pipe = 2'b00;
+  always @(posedge clk_video_54) begin
+    new_vmode_video_pipe <= {new_vmode_video_pipe[0], new_vmode};
+  end
+  wire new_vmode_video = new_vmode_video_pipe[1];
 
   wire [127:0] status;
   wire [  1:0] hps_buttons;
@@ -120,12 +162,14 @@ module emu (
   wire        ioctl_upload_req = 0;
   wire [15:0] ioctl_index;
   wire        ioctl_wr;
+  wire        ioctl_wait;
   wire [26:0] ioctl_addr;
   wire [15:0] ioctl_dout;
   wire [15:0] ioctl_din = 0;
 
   wire [10:0] ps2_key;
   wire [31:0] joystick_0;
+  wire [31:0] joystick_1;
 
   hps_io #(
       .CONF_STR(CONF_STR),
@@ -144,7 +188,7 @@ module emu (
       .status_menumask(16'd0),
 
       .video_rotated(1'b0),
-      .new_vmode(1'b0),
+      .new_vmode(new_vmode_video),
 
       .info_req(1'b0),
       .info(8'd0),
@@ -158,23 +202,33 @@ module emu (
       .ioctl_dout        (ioctl_dout),
       .ioctl_din         (ioctl_din),
       .ioctl_index       (ioctl_index),
-      .ioctl_wait        (1'b0),
+      .ioctl_wait        (ioctl_wait),
 
       .ps2_key(ps2_key),
 
-      .joystick_0(joystick_0)
+      .joystick_0(joystick_0),
+      .joystick_1(joystick_1)
   );
 
   wire external_reset = status[0];
   wire accurate_lcd_timing = status[1];
   wire [3:0] inactive_lcd_alpha_selection = status[5:2];
+`ifdef CORE_ENABLE_DEBUG_OVERLAY
   wire debug_video = status[6];
   wire [1:0] debug_view = status[8:7];
   wire debug_freeze = status[9];
-  wire crt_video = ~status[10];
+`else
+  wire debug_video = 1'b0;
+  wire [1:0] debug_view = 2'b00;
+  wire debug_freeze = 1'b0;
+`endif
+  wire requested_crt_video = ~status[10];
+  wire crt_video = active_crt_video;
 
-  assign VIDEO_ARX = crt_video ? 13'd4 : 13'd1;
-  assign VIDEO_ARY = crt_video ? 13'd3 : 13'd1;
+  // Aspect ratio follows the mode actually committed by the output bridge,
+  // not the independently clocked source-domain request.
+  assign VIDEO_ARX = transport_active_crt ? 13'd4 : 13'd1;
+  assign VIDEO_ARY = transport_active_crt ? 13'd3 : 13'd1;
 
   reg [7:0] lcd_off_alpha;
 
@@ -232,7 +286,19 @@ module emu (
     end
   end
 
-  wire sound;
+  wire signed [15:0] core_audio;
+  wire source_vsync;
+  wire source_hsync;
+  wire source_vblank;
+  wire source_hblank;
+  wire source_de;
+  wire source_ce_pix;
+  wire [23:0] source_rgb;
+  wire source_packet_wr;
+  wire [29:0] source_packet;
+  wire crt_source_tick_toggle;
+  wire source_video_held;
+
   wire vsync;
   wire hsync;
   wire vblank;
@@ -241,44 +307,74 @@ module emu (
   wire ce_pix;
   wire [23:0] rgb;
 
+  // Keep the output blank long enough for the largest SDRAM line buffer to
+  // refill after its base address changes (2160 16-bit words natively).
+  video_mode_control #(
+      .SETTLE_CYCLES(4096)
+  ) video_mode_control (
+      .clk_sys(clk_sys_99_287),
+      .reset(RESET),
+      .clocks_ready(pll_core_locked && pll_video_locked),
+      .request_crt(requested_crt_video),
+      .video_vblank(source_vblank),
+      .video_held(source_video_held),
+      .active_crt(active_crt_video),
+      .hold_video(hold_video),
+      .new_vmode(new_vmode)
+  );
+
   gameandwatch gameandwatch (
       .clk_sys_99_287(clk_sys_99_287),
-      .clk_vid_33_095(clk_video),
+      .clk_vid_33_095(clk_sys_99_287),
 
       .reset(RESET || ioctl_download || ~has_rom || external_reset || hps_buttons[1]),
+      .video_blank(RESET || ~has_rom || external_reset || hps_buttons[1]),
       .pll_core_locked(pll_core_locked),
 
       .button_a(joystick_0[5]),
       .button_b(joystick_0[4]),
       .button_x(joystick_0[7]),
       .button_y(joystick_0[6]),
-      .button_trig_l(joystick_0[8]),
-      .button_trig_r(joystick_0[9]),
-      .button_start(joystick_0[11]),
-      .button_select(joystick_0[10]),
+      .button_aux(joystick_0[13:8]),
+      .osd_status(OSD_STATUS),
       .dpad_up(joystick_0[3]),
       .dpad_down(joystick_0[2]),
       .dpad_left(joystick_0[1]),
       .dpad_right(joystick_0[0]),
+      .player_two_button_a(joystick_1[5]),
+      .player_two_button_b(joystick_1[4]),
+      .player_two_button_x(joystick_1[7]),
+      .player_two_button_y(joystick_1[6]),
+      .player_two_button_aux(joystick_1[13:8]),
+      .player_two_dpad_up(joystick_1[3]),
+      .player_two_dpad_down(joystick_1[2]),
+      .player_two_dpad_left(joystick_1[1]),
+      .player_two_dpad_right(joystick_1[0]),
 
       .ioctl_download(ioctl_download),
       .ioctl_wr(ioctl_wr),
       .ioctl_addr({1'b0, ioctl_addr[24:1]}),
       .ioctl_dout(ioctl_dout),
+      .ioctl_wait(ioctl_wait),
 
-      .hsync(hsync),
-      .vsync(vsync),
-      .hblank(hblank),
-      .vblank(vblank),
-      .de(de),
-      .ce_pix(ce_pix),
-      .rgb(rgb),
+      .hsync(source_hsync),
+      .vsync(source_vsync),
+      .hblank(source_hblank),
+      .vblank(source_vblank),
+      .de(source_de),
+      .ce_pix(source_ce_pix),
+      .rgb(source_rgb),
+      .source_packet_wr(source_packet_wr),
+      .source_packet(source_packet),
+      .video_held(source_video_held),
 
-      .sound(sound),
+      .audio(core_audio),
 
       .accurate_lcd_timing(accurate_lcd_timing),
       .lcd_off_alpha(lcd_off_alpha),
       .crt_video(crt_video),
+      .hold_video(hold_video),
+      .crt_source_tick_async(crt_source_tick_toggle),
 
       .debug_video(debug_video),
       .debug_view(debug_view),
@@ -297,7 +393,44 @@ module emu (
       .SDRAM_nWE(SDRAM_nWE)
   );
 
-  assign CLK_VIDEO = clk_video;
+  wire transport_packet_ready;
+  wire [9:0] transport_packet_level_source;
+  wire [9:0] transport_packet_level_video;
+  wire transport_running;
+  wire transport_fault;
+  video_transport_54 #(
+      .PREFILL_WORDS(512)
+  ) video_transport (
+      .clk_source(clk_sys_99_287),
+      .clk_video_54(clk_video_54),
+      .reset(video_transport_reset),
+      .crt_mode_async(crt_video),
+      .hold_async(hold_video),
+      .packet_wr(source_packet_wr),
+      .packet_data(source_packet),
+      .packet_ready(transport_packet_ready),
+      .packet_level_source(transport_packet_level_source),
+      .packet_level_video(transport_packet_level_video),
+      .crt_source_tick_toggle(crt_source_tick_toggle),
+      .ce_pixel(ce_pix),
+      .hsync(hsync),
+      .vsync(vsync),
+      .hblank(hblank),
+      .vblank(vblank),
+      .de(de),
+      .rgb(rgb),
+      .active_crt_mode(transport_active_crt),
+      .running(transport_running),
+      .fault(transport_fault)
+  );
+
+  // CLK_VIDEO must be a direct PLL clock because the MiSTer framework places
+  // its own clock selector after this boundary. CRT mode exposes an actual
+  // 360-sample CE /8 transport, giving 2880 active and 3432 total raw clocks
+  // at 54 MHz. Native mode remains
+  // emitted using an exact-average 32.768 MHz CE, although Direct Video support
+  // is intentionally only claimed for the CRT mode.
+  assign CLK_VIDEO = clk_video_54;
   assign CE_PIXEL = ce_pix;
 
   assign VGA_R = rgb[23:16];
@@ -308,10 +441,8 @@ module emu (
   assign VGA_DE = de;
   assign VGA_SL = 2'b00;
 
-  localparam signed [15:0] AUDIO_PIEZO_LEVEL = 16'sh2000;
-
   assign AUDIO_S = 1;
-  assign AUDIO_L = sound ? AUDIO_PIEZO_LEVEL : -AUDIO_PIEZO_LEVEL;
+  assign AUDIO_L = core_audio;
   assign AUDIO_R = AUDIO_L;
 
 endmodule

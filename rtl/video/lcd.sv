@@ -6,6 +6,8 @@ module lcd (
     input wire [3:0] cpu_id,
 
     input wire mask_data_wr,
+    input wire crt_mask_data_wr,
+    input wire crt_mask_data_start,
     input wire [15:0] mask_data,
 
     // Segments
@@ -22,12 +24,13 @@ module lcd (
     input wire divider_1khz,
 
     // Video counters
-    input wire crt_video,
+    input wire use_crt_assets,
+    input wire pixel_tick,
+    input wire [1:0] source_x_step,
     input wire vblank_int,
     input wire hblank_int,
     input wire [10:0] video_x,
     input wire [9:0] video_y,
-    input wire [1:0] source_x_step,
 
     output wire segment_en
 );
@@ -81,16 +84,19 @@ module lcd (
       .cpu_id(cpu_id),
 
       .mask_data_wr(mask_data_wr),
+      .crt_mask_data_wr(crt_mask_data_wr),
+      .crt_mask_data_start(crt_mask_data_start),
       .mask_data(mask_data),
 
       .segments(vsync_segments),
 
-      .crt_video(crt_video),
+      .use_crt_assets(use_crt_assets),
+      .pixel_tick(pixel_tick),
+      .source_x_step(source_x_step),
       .vblank_int(vblank_int),
       .hblank_int(hblank_int),
       .video_x(video_x),
       .video_y(video_y),
-      .source_x_step(source_x_step),
 
       .segment_en(segment_en)
   );

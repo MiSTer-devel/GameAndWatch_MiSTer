@@ -1,5 +1,7 @@
 module counts (
     input wire clk,
+    input wire reset,
+    input wire hold,
     input wire ce_pix,
     input wire crt_video,
 
@@ -8,10 +10,10 @@ module counts (
 
     output reg  hsync = 0,
     output reg  vsync = 0,
-    output wire hblank,
-    output wire vblank,
+    output reg  hblank = 1,
+    output reg  vblank = 1,
 
-    output wire de
+    output reg  de = 0
 );
   localparam [10:0] NORMAL_WIDTH = 11'd720;
   localparam [9:0] NORMAL_HEIGHT = 10'd720;
@@ -24,11 +26,11 @@ module counts (
   localparam [10:0] CRT_WIDTH = 11'd360;
   localparam [9:0] CRT_HEIGHT = 10'd240;
   localparam [9:0] CRT_MAX_Y = 10'd262;
-  localparam [10:0] CRT_MAX_X = 11'd416;
-  localparam [10:0] CRT_HSYNC_START = 11'd376;
-  localparam [10:0] CRT_HSYNC_END = 11'd400;
-  localparam [9:0] CRT_VSYNC_START = 10'd243;
-  localparam [9:0] CRT_VSYNC_END = 10'd246;
+  localparam [10:0] CRT_MAX_X = 11'd429;
+  localparam [10:0] CRT_HSYNC_START = 11'd370;
+  localparam [10:0] CRT_HSYNC_END = 11'd401;
+  localparam [9:0] CRT_VSYNC_START = 10'd244;
+  localparam [9:0] CRT_VSYNC_END = 10'd247;
 
   wire [10:0] width = crt_video ? CRT_WIDTH : NORMAL_WIDTH;
   wire [9:0] height = crt_video ? CRT_HEIGHT : NORMAL_HEIGHT;
@@ -40,15 +42,20 @@ module counts (
 
   initial begin
     $display("Normal video: 720x720 active, 756x730 total");
-    $display("CRT video: 360x240 active, 416x262 total");
+    $display("CRT video: 360x240 active, 429x262 total");
   end
 
-  assign de = x < width && y < height;
-  assign vblank = y >= height;
-  assign hblank = x >= width;
-
   always @(posedge clk) begin
-    if (ce_pix) begin
+    if (reset || hold) begin
+      // Seed the final count so the first CE after release begins at (0,0).
+      x <= max_x - 11'd1;
+      y <= max_y - 10'd1;
+      hsync <= 1'b0;
+      vsync <= 1'b0;
+      hblank <= 1'b1;
+      vblank <= 1'b1;
+      de <= 1'b0;
+    end else if (ce_pix) begin
       reg [10:0] next_x;
       reg [9:0] next_y;
 
@@ -77,6 +84,15 @@ module counts (
 
       x <= next_x;
       y <= next_y;
+
+      // Keep the blanking controls registered with the counters. These
+      // signals cross into the faster image-reader clock domain, and a
+      // combinational comparison can glitch when several binary counter bits
+      // change together (notably x=511 -> 512). A false hblank pulse clears
+      // both asynchronous image FIFOs and corrupts the rest of the scanline.
+      hblank <= next_x >= width;
+      vblank <= next_y >= height;
+      de <= next_x < width && next_y < height;
     end
   end
 

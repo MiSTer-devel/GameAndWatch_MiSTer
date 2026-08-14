@@ -5,6 +5,7 @@ module sm510 (
     input wire clk_en,
 
     input wire reset,
+    input wire acl,
 
     // The type of CPU being implemented
     input wire [3:0] cpu_id,
@@ -67,8 +68,12 @@ module sm510 (
 
   reg [5:0] last_Pl = 0;
 
-	  wire gamma;
-	  wire [3:0] gamma_flags;
+	  wire divider_gamma;
+	  wire [3:0] divider_gamma_flags;
+	  reg sm5a_acl_gamma = 0;
+	  wire gamma = divider_gamma | (cpu_id == 4'd4 && sm5a_acl_gamma);
+	  wire [3:0] gamma_flags =
+	      divider_gamma_flags | {3'b000, cpu_id == 4'd4 && sm5a_acl_gamma};
 	  wire divider_1s_tick;
 
   wire divider_4hz;
@@ -102,6 +107,62 @@ module sm510 (
       .input_ba(input_ba)
   );
 
+  // CPU families and instruction-clock phases are declared before their first use so the
+  // production RTL is accepted by both Quartus and standalone SystemVerilog simulators.
+  wire is_sm510 = cpu_id == 0 || cpu_id == 5;
+  wire is_sm511_family = cpu_id == 1 || cpu_id == 2 || cpu_id == 6 || cpu_id == 7;
+  wire is_sm530 = cpu_id == 3;
+  wire is_sm5a = cpu_id == 4;
+
+  // ACL is a CPU reset pin, not a core reset. Its architectural reset work is
+  // performed once per assertion while the level itself holds execution.
+  reg acl_previous = 0;
+  wire acl_assert = acl && !acl_previous;
+
+  always @(posedge clk) begin
+    if (reset) begin
+      acl_previous <= 0;
+    end else begin
+      acl_previous <= acl;
+    end
+  end
+
+  // SM500/SM5A ACL invokes IDIV, whose MAME 0.289 implementation preserves
+  // divider bits 5:0. Queue it until the next 32.768kHz divider tick.
+  reg sm5a_acl_idiv_pending = 0;
+  wire sm5a_acl_idiv = is_sm5a && (acl_assert || sm5a_acl_idiv_pending);
+
+  always @(posedge clk) begin
+    if (reset || !is_sm5a) begin
+      sm5a_acl_idiv_pending <= 0;
+    end else if (clk_en) begin
+      sm5a_acl_idiv_pending <= 0;
+    end else if (acl_assert) begin
+      sm5a_acl_idiv_pending <= 1;
+    end
+  end
+
+  // SM500/SM5A ACL also sets gamma. Keep that state separate from the base
+  // divider so an ordinary ACL never resets divider/gamma on other families.
+  always @(posedge clk) begin
+    if (reset || !is_sm5a) begin
+      sm5a_acl_gamma <= 0;
+    end else if (acl_assert) begin
+      sm5a_acl_gamma <= 1;
+    end else if (clk_en && inst.reset_gamma) begin
+      sm5a_acl_gamma <= 0;
+    end
+  end
+
+  reg sm511_clock_phase = 0;
+  reg [1:0] sm530_clock_phase = 0;
+  // A normal instruction uses two state-machine phases. SM530 completes those two phases
+  // over three oscillator clocks; enabling only once per three clocks would halve the CPU
+  // rate relative to its divider and gamma timers.
+  wire instr_clk_en = clk_en && !acl &&
+      (!is_sm511_family || !inst.sm511_slow_clock || sm511_clock_phase) &&
+      (!is_sm530 || sm530_clock_phase != 2'd0);
+
   assign rom_addr = inst.rom_addr;
   assign rom_rd_en = instr_clk_en;
   assign melody_addr = inst.melody_address;
@@ -119,14 +180,14 @@ module sm510 (
 
       .cpu_id(cpu_id),
 
-	      .reset_gamma(inst.reset_gamma),
-	      .reset_gamma_mask(inst.reset_gamma_mask),
-	      .reset_divider(inst.reset_divider),
-	      .reset_divider_keep_6(inst.reset_divider_keep_6),
-	      .reset_10ms_counter(inst.reset_10ms_counter),
+	      .reset_gamma(inst.reset_gamma && !acl),
+	      .reset_gamma_mask(acl ? 4'h0 : inst.reset_gamma_mask),
+	      .reset_divider(inst.reset_divider && !acl),
+	      .reset_divider_keep_6((inst.reset_divider_keep_6 && !acl) || sm5a_acl_idiv),
+	      .reset_10ms_counter(inst.reset_10ms_counter && !acl),
 
-	      .gamma(gamma),
-	      .gamma_flags(gamma_flags),
+	      .gamma(divider_gamma),
+	      .gamma_flags(divider_gamma_flags),
 	      .divider_1s_tick(divider_1s_tick),
 
       .divider_4hz(divider_4hz),
@@ -239,7 +300,7 @@ module sm510 (
 
       // While temp_sbm is set, we operate as if the highest bit is high, rather than its current value
       .addr(ram_addr_with_masks),
-      .wren(inst.ram_wr),
+      .wren(inst.ram_wr && !acl),
       .data(inst.ram_wr_data),
       .q(ram_data),
 
@@ -257,7 +318,7 @@ module sm510 (
   reg reset_halt = 0;
 
   always @(posedge clk) begin
-    if (reset) begin
+    if (reset || acl) begin
       reset_halt <= 0;
     end else if (clk_en) begin
       reset_halt <= 0;
@@ -275,18 +336,6 @@ module sm510 (
 
   ////////////////////////////////////////////////////////////////////////////////////////
   // Stages
-
-  // SM510 | SM510 Tiger
-  wire is_sm510 = cpu_id == 0 || cpu_id == 5;
-
-  // SM511 | SM512
-  wire is_sm511_family = cpu_id == 1 || cpu_id == 2 || cpu_id == 6 || cpu_id == 7;
-
-  // SM530
-  wire is_sm530 = cpu_id == 3;
-
-  // SM5a
-  wire is_sm5a = cpu_id == 4;
 
   // LBL xy | TL/TML xyz
   wire is_two_bytes_sm510 = opcode == 8'h5F || opcode[7:4] == 4'h7;
@@ -310,14 +359,8 @@ module sm510 (
   // LAX x
 	  wire is_lax = is_sm530 ? opcode[7:4] == 4'h1 : opcode[7:4] == 4'h2;
 
-	  reg sm511_clock_phase = 0;
-	  reg [1:0] sm530_clock_phase = 0;
-	  wire instr_clk_en = clk_en &&
-	      (!is_sm511_family || !inst.sm511_slow_clock || sm511_clock_phase) &&
-	      (!is_sm530 || sm530_clock_phase == 2'd2);
-
   always @(posedge clk) begin
-    if (reset) begin
+    if (reset || acl) begin
 	      sm511_clock_phase <= 0;
 	      sm530_clock_phase <= 0;
 	    end else if (clk_en) begin
@@ -350,7 +393,7 @@ module sm510 (
   reg [3:0] stage = STAGE_LOAD_PC;
 
   always @(posedge clk) begin
-    if (reset) begin
+    if (reset || acl) begin
       // rom_data <= 0;
 
       stage <= STAGE_LOAD_PC;
@@ -1072,6 +1115,69 @@ module sm510 (
       end
 
       inst.init_pla();
+    end else if (acl_assert) begin
+      // MAME's ACL reset is intentionally narrower than the MiSTer/system
+      // reset above. Data RAM, divider state, general registers, stacks, W/S
+      // outputs, and LCD data latches survive unless a CPU-family override
+      // below explicitly changes them.
+      case (cpu_id)
+        3, 4:    {inst.Pu, inst.Pm, inst.Pl} <= {2'h0, 4'hF, 6'b0};
+        default: {inst.Pu, inst.Pm, inst.Pl} <= {2'h3, 4'h7, 6'b0};
+      endcase
+
+      inst.skip_next_instr  <= 0;
+      inst.skip_next_if_lax <= 0;
+      inst.temp_sbm         <= 0;
+      inst.temp_sabl        <= 0;
+      inst.halt             <= 0;
+
+      // Discard only the internal deferred-address transaction. Bm/Bl are
+      // architectural registers and deliberately retain their current value.
+      inst.next_ram_addr    <= {inst.Bm[1:0], inst.Bl};
+      inst.wr_next_ram_addr <= 0;
+      inst.ram_wr           <= 0;
+
+      // These are one-cycle requests emitted by the interrupted instruction.
+      // None may leak through after ACL; SM5A's required IDIV is generated by
+      // the dedicated ACL request above.
+      inst.reset_divider        <= 0;
+      inst.reset_divider_keep_6 <= 0;
+      inst.reset_gamma          <= 0;
+      inst.reset_gamma_mask     <= 0;
+      inst.reset_10ms_counter   <= 0;
+
+      last_Pl        <= 0;
+      last_opcode    <= 0;
+      last_temp_sbm  <= 0;
+      last_temp_sabl <= 0;
+
+      // Base ACL state: LCD on, bleeder off, blink/Y off, and R pins low.
+      // SM530 uses its separate display-enable latch and resets BP to zero.
+      inst.lcd_bp    <= is_sm530 ? 1'b0 : 1'b1;
+      inst.lcd_bc    <= 0;
+      inst.segment_y <= 0;
+      inst.output_r  <= 0;
+      inst.stored_output_r <= is_sm5a ? 4'hF : 4'h0;
+
+      if (is_sm511_family || is_sm530) begin
+        // ACL disables melody without clearing the stop flag, address, or
+        // phase counters, and restores the slow instruction clock.
+        inst.melody_rd[0]   <= 0;
+        inst.sm511_slow_clock <= 1;
+      end
+
+      if (is_sm530) begin
+        inst.sm530_display_enabled <= 1;
+      end
+
+      if (is_sm5a) begin
+        // SM500/SM5A push the reset-vector PC and reset their control-bank
+        // state. Their R control latch becomes active-low 0xf.
+        inst.stack_s          <= 12'h3C0;
+        inst.cb_bank          <= 0;
+        inst.within_subroutine <= 0;
+        inst.lcd_cn           <= 0;
+      end
     end else if (clk_en) begin
 	      inst.reset_divider <= 0;
 	      inst.reset_divider_keep_6 <= 0;
@@ -1177,7 +1283,11 @@ module sm510 (
 	              end
 	            end
             8'b0110_10XX: begin
-              if (is_sm511_family) begin
+              if (is_sm530) begin
+                // Only 6B reaches this two-byte range on SM530: LBL xy.
+                inst.Bm <= opcode[6:4];
+                inst.Bl <= opcode[3:0];
+              end else if (is_sm511_family) begin
                 // TML xyz (2 byte). Long call. Push PC + 1 into stack registers. Load PC with immediates.
                 inst.push_stack(pc_inc);
 
@@ -1198,19 +1308,12 @@ module sm510 (
 	              inst.Bm <= opcode[6:4];
 	              inst.Bl <= opcode[3:0];
 	            end
-	            8'h6B: begin
-	              if (is_sm530) begin
-	                inst.Bm <= opcode[6:4];
-	                inst.Bl <= opcode[3:0];
-	              end
-	            end
-	            8'h78: begin
-	              if (is_sm530) begin
-	                inst.pre();  // PRE x. Preset melody ROM address
-	              end
-	            end
 	            8'h7X: begin
-              if (is_sm511_family) begin
+              if (is_sm530) begin
+                // SM530 0x78 is PRE. Keep it in the family-qualified 0x7X
+                // arm so the same first byte remains TL on SM510/SM511.
+                inst.pre();
+              end else if (is_sm511_family) begin
                 // SM511/SM512: TL xyz uses the full 0x70-0x7F opcode range.
                 {inst.Pu, inst.Pm, inst.Pl} <= {opcode[7:6], last_opcode[3:0], opcode[5:0]};
               end else if (is_sm510) begin
