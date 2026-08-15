@@ -59,6 +59,7 @@ module gameandwatch (
     input wire crt_video,
     input wire hold_video,
     input wire crt_source_tick_async,
+    input wire native_source_pause_async,
 
     // Debug
     input wire debug_video,
@@ -114,6 +115,9 @@ module gameandwatch (
       sys_config.crt_mask_descriptor_valid &&
       sys_config.crt_image_payload_valid &&
       sys_config.crt_mask_payload_valid;
+  localparam [7:0] FEATURE_DEFAULT_SOUND_ON = 8'h20;
+  wire default_sound_on = sys_config.format_version >= 8'd2 &&
+      (sys_config.feature_flags & FEATURE_DEFAULT_SOUND_ON) != 8'd0;
 
   rom_loader rom_loader (
       .clk(clk_sys_99_287),
@@ -349,6 +353,7 @@ module gameandwatch (
       .acl(input_acl),
 
       .cpu_id(cpu_id),
+      .default_sound_on(default_sound_on),
 
       .rom_data(rom_data),
       .rom_addr(rom_addr),
@@ -542,6 +547,7 @@ module gameandwatch (
       .crt_video(crt_video),
       .hold_video(hold_video),
       .crt_source_tick_async(crt_source_tick_async),
+      .native_source_pause_async(native_source_pause_async),
       .crt_assets_valid(crt_assets_valid),
 
       .mask_data_wr(mask_config_download && ioctl_wr),

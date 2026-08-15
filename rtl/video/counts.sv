@@ -19,9 +19,15 @@ module counts (
   localparam [9:0] NORMAL_HEIGHT = 10'd720;
   localparam [9:0] NORMAL_MAX_Y = 10'd730;
   localparam [10:0] NORMAL_MAX_X = 11'd756;
-  localparam [10:0] NORMAL_HSYNC_X = 11'd725;
-  localparam [9:0] NORMAL_VSYNC_Y = 10'd725;
-  localparam [10:0] NORMAL_VSYNC_X = 11'd721;
+  // Native blanking is 36 pixels and 10 lines. Use conventional sync widths
+  // inside those unchanged totals: horizontal front/sync/back = 5/8/23 and
+  // vertical front/sync/back = 5/2/3. The former single-pixel VS pulse was
+  // only 18.5 or 37 ns after the fixed-54 transport and could be missed by
+  // the framework scaler's asynchronous frame-buffer rotation event.
+  localparam [10:0] NORMAL_HSYNC_START = 11'd725;
+  localparam [10:0] NORMAL_HSYNC_END = 11'd733;
+  localparam [9:0] NORMAL_VSYNC_START = 10'd725;
+  localparam [9:0] NORMAL_VSYNC_END = 10'd727;
 
   localparam [10:0] CRT_WIDTH = 11'd360;
   localparam [9:0] CRT_HEIGHT = 10'd240;
@@ -78,8 +84,8 @@ module counts (
         hsync <= next_x >= CRT_HSYNC_START && next_x < CRT_HSYNC_END;
         vsync <= next_y >= CRT_VSYNC_START && next_y < CRT_VSYNC_END;
       end else begin
-        hsync <= next_x == NORMAL_HSYNC_X;
-        vsync <= next_y == NORMAL_VSYNC_Y && next_x == NORMAL_VSYNC_X;
+        hsync <= next_x >= NORMAL_HSYNC_START && next_x < NORMAL_HSYNC_END;
+        vsync <= next_y >= NORMAL_VSYNC_START && next_y < NORMAL_VSYNC_END;
       end
 
       x <= next_x;

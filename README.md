@@ -28,19 +28,23 @@ each CRT source pixel and holds a recovered source SOF until the next local
 frame boundary, so the two clock domains cannot resume at mismatched raster
 coordinates.
 
-The current release-style artifact is
-`releases/GameAndWatch_20260813_nodebug_timing.rbf`: 3,488,500 bytes, SHA-256
-`5F38DEB3152B422E2D999A02AB0F4E50DE7DEB3572834073D74FB45AA059E14B`.
+The current release-style artifact is `output_files/GameAndWatch.rbf`:
+3,494,544 bytes, SHA-256
+`16E14B86EBA8C9422F9C6F9E966BA5C01627659193D6EDD7070912B556DBEF6F`.
 Normal builds leave `CORE_ENABLE_DEBUG_OVERLAY` undefined, removing the debug
-menu entries, capture state, and pixel grid. The fixed-54 video domain has
-`+8.155 ns` setup slack and its transport/CDC audit is clean. The 98.3203125 MHz
-core domain is within the project's accepted one-nanosecond floor at
-`-0.605 ns` worst setup slack and `-1.917 ns` TNS, although this is not strict
-zero-slack timing closure. The previous request-locked artifact remains the
-hardware-smoked build: with Direct Video disabled, nine USB-2 Star Fox
-screenshots captured every four seconds were byte-identical at 360x240. The new
-debug-free artifact has not yet been deployed or hardware-smoked. Morph/analog
-lock and audible sound quality remain user-observed hardware checks.
+menu entries, capture state, and pixel grid. The transport/CDC audit is clean.
+The 98.3203125 MHz core domain is within the project's accepted one-nanosecond
+floor at `-0.401 ns` worst setup slack and `-0.587 ns` TNS, although this is not
+strict zero-slack timing closure.
+
+Native output remains exactly 32.768 MHz and approximately 59.375 Hz. Its
+internal packet producer runs at 32.7734375 MHz and is paused between FIFO
+occupancy thresholds 768 and 640, providing elasticity without changing the
+visible raster. A USB-2 Star Fox smoke test captured 60 one-second-spaced
+720x720 frames: the first was the normal startup transition and frames 1-59
+were byte-identical, with no partial or black frames. The saved CFG and prior
+core were restored afterward. Morph/analog lock and audible sound quality
+remain user-observed hardware checks.
 
 ## Installation Instructions
 
@@ -96,6 +100,7 @@ Squeeze does not run correctly due to having a completely different artwork desi
 * Generator-native artwork and LCD masks for both resolutions in each current package
 * Independent two-player controls for Boxing, Donkey Kong 3, and Donkey Kong Hockey
 * Trace-matched HA1152/HMC sound effects for Nelsonic Star Fox using its dumped 128-byte effect ROM
+* Package-declared default-on music for Nelsonic Super Mario Bros. 3, with a global Audio mute
 * Sample-backed MSM6373 voice support for Star Trek, Teenage Mutant Ninja Turtles II, and Top Gun
 * Ability to show inactive LCD segments with configurable opacity
 * Deflicker on the LCD
@@ -106,6 +111,7 @@ Squeeze does not run correctly due to having a completely different artwork desi
 * `Native Video` - selects `360x240 CRT` (the default 4:3 presentation) or `720x720` (1:1). Current dual-resolution packages switch image and LCD-mask banks with the timing mode; older packages use a compatibility bridge in CRT mode.
 * `Inact. LCD Alpha` - sets the opacity of inactive LCD segments from Off (the default) through 100%.
 * `Acc. LCD Timing` - uses the original 64 Hz LCD update behavior when enabled. The default 1 kHz update avoids visible flicker on modern displays.
+* `Audio` - leaves game audio on by default or mutes the final core output without changing emulated sound state.
 
 ## Core Docs
 

@@ -3,6 +3,7 @@ module ram (
     input wire reset,
 
     input wire [3:0] cpu_id,
+    input wire       default_sound_on,
 
     input wire [6:0] addr,
     input wire wren,
@@ -110,7 +111,12 @@ module ram (
       end
     end else begin
       // TODO: Does this need to be comb?
-      q <= ram[final_addr];
+      // Nelsonic SMB3 normally boots with its alarm/melody bit clear. A
+      // package may request the compatibility default without modifying its
+      // program ROM or stored RAM: only CPU reads of the exact SM530 flag see
+      // bit 3 asserted. All writes and every other RAM bit remain authentic.
+      q <= ram[final_addr] |
+          ((cpu_id == 4'd3 && default_sound_on && final_addr == 7'h37) ? 4'h8 : 4'h0);
 
       if (wren) begin
         ram[final_addr] <= data;

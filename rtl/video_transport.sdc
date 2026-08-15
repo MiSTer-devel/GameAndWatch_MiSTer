@@ -165,6 +165,14 @@ set GW_CRT_TICK_META [gw_keeper_set crt_source_tick_first_stage \
     {*|video_timing:video_timing|crt_tick_meta} 1]
 set_false_path -to $GW_CRT_TICK_META
 
+# Native ALIGN holds the source compositor at its SOF while the independent
+# output raster reaches its own frame boundary. Cut only the first stage of
+# that return-level synchronizer; the meta-to-sync stage remains timed by the
+# core clock.
+set GW_NATIVE_PAUSE_META [gw_keeper_set native_source_pause_first_stage \
+    {*|video_timing:video_timing|native_pause_meta} 1]
+set_false_path -to $GW_NATIVE_PAUSE_META
+
 # hps_io consumes new_vmode in the fixed-54 MHz domain. Cut only the first
 # stage of the explicit two-register toggle synchronizer; the second-stage
 # data path remains timed by the video clock.

@@ -11,6 +11,7 @@ module video #(
     input wire crt_video,
     input wire hold_video,
     input wire crt_source_tick_async,
+    input wire native_source_pause_async,
     input wire crt_assets_valid,
 
     // Data in
@@ -253,6 +254,21 @@ module video #(
   wire [23:0] final_rgb = processed_rgb;
 `endif
 
+  // Hardware A/B diagnostic for native artifacts. This preserves the source
+  // raster, packet FIFO, fixed-54 transport, and MiSTer scaler while removing
+  // only the near-saturating artwork SDRAM reads. Every active pixel encodes
+  // its exact source coordinate so a repeated, skipped, or reordered region
+  // remains visible and machine-checkable in captured screenshots.
+`ifdef CORE_DIAGNOSTIC_VIDEO_PATTERN
+  wire [23:0] transport_rgb = {video_x, video_y, 3'b101};
+`else
+  wire [23:0] transport_rgb = final_rgb;
+`endif
+
+  wire artwork_sd_end_burst;
+  wire artwork_sd_rd;
+  wire [24:0] artwork_sd_rd_addr;
+
   rgb_controller rgb_controller (
       .clk_sys_99_287(clk_sys_99_287),
       .clk_vid_33_095(clk_vid_33_095),
@@ -274,10 +290,19 @@ module video #(
       // SDRAM
       .sd_data_available(sd_data_available),
       .sd_out(sd_out),
-      .sd_end_burst(sd_end_burst),
-      .sd_rd(sd_rd),
-      .sd_rd_addr(sd_rd_addr)
+      .sd_end_burst(artwork_sd_end_burst),
+      .sd_rd(artwork_sd_rd),
+      .sd_rd_addr(artwork_sd_rd_addr)
   );
+
+`ifdef CORE_DIAGNOSTIC_VIDEO_PATTERN
+  assign sd_end_burst = 1'b0;
+  assign sd_rd = 1'b0;
+`else
+  assign sd_end_burst = artwork_sd_end_burst;
+  assign sd_rd = artwork_sd_rd;
+`endif
+  assign sd_rd_addr = artwork_sd_rd_addr;
 
   ////////////////////////////////////////////////////////////////////////////////////////
   // Sync counts
@@ -306,7 +331,7 @@ module video #(
         // MiSTer framework can render its OSD before any package is loaded.
         // The synchronous next-pixel packet gives mask and segments two full
         // clocks to resolve final_rgb before the next native 3/4-gap CE edge.
-        rgb <= content_reset ? 24'd0 : final_rgb;
+        rgb <= content_reset ? 24'd0 : transport_rgb;
 
         // Register the complete pixel and its timing together. The FIFO sees
         // source_packet_wr on the following 98.3203125 MHz edge, after this bus
@@ -319,7 +344,7 @@ module video #(
           hblank_int,
           vblank_int,
           de_int,
-          content_reset ? 24'd0 : final_rgb
+          content_reset ? 24'd0 : transport_rgb
         };
         source_packet_wr <= 1'b1;
       end
@@ -334,6 +359,7 @@ module video #(
       .crt_mode_async(crt_video),
       .hold_async(hold_video),
       .crt_tick_async(crt_source_tick_async),
+      .native_pause_async(native_source_pause_async),
       .x(video_x),
       .y(video_y),
       .hsync (hsync_int),

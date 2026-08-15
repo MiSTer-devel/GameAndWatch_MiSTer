@@ -3,10 +3,11 @@
 // The source writes one atomic packet per accepted source pixel:
 //   {sof, hsync, vsync, hblank, vblank, de, rgb[23:0]}.
 //
-// Native mode preserves those timing fields and consumes packets with the
-// exact rational cadence 54 MHz * 2048 / 3375 = 32.768 MHz. CRT mode consumes
-// the 360x240 / 429x262 source one-for-one at exactly 54 MHz / 8 = 6.75 MHz.
-// All externally visible signals change only on CE edges.
+// Both modes own their raster controls in this 54 MHz domain. Native consumes
+// RGB packets at the exact rational cadence 54 MHz * 2048 / 3375 = 32.768 MHz;
+// CRT consumes the 360x240 source at exactly 54 MHz / 8 = 6.75 MHz. Packet
+// timing bits are acquisition evidence only, so a FIFO recovery can black RGB
+// without stretching or reordering the framework-visible raster.
 module video_transport_54 #(
     parameter integer PREFILL_WORDS = 512,
     parameter integer FLUSH_CYCLES = 8
@@ -29,6 +30,10 @@ module video_transport_54 #(
     // CRT source pacing request. This toggle crosses back to clk_source and
     // advances the compositor exactly once per fixed /8 output pixel.
     output reg crt_source_tick_toggle = 1'b0,
+    // Native source pause is a level CDC. The source synchronizes it and
+    // freezes its slightly leading NCO while this bridge waits in ALIGN or
+    // trims FIFO occupancy during RUN. It never changes the output raster.
+    output wire native_source_pause,
 
     output wire ce_pixel,
     output reg hsync = 1'b0,
@@ -57,6 +62,15 @@ module video_transport_54 #(
   localparam [9:0] CRT_TOTAL_Y = 10'd262;
   localparam [9:0] CRT_VSYNC_START = 10'd244;
   localparam [9:0] CRT_VSYNC_END = 10'd247;
+
+  localparam [10:0] NATIVE_ACTIVE_X = 11'd720;
+  localparam [10:0] NATIVE_TOTAL_X = 11'd756;
+  localparam [10:0] NATIVE_HSYNC_START = 11'd725;
+  localparam [10:0] NATIVE_HSYNC_END = 11'd733;
+  localparam [9:0] NATIVE_ACTIVE_Y = 10'd720;
+  localparam [9:0] NATIVE_TOTAL_Y = 10'd730;
+  localparam [9:0] NATIVE_VSYNC_START = 10'd725;
+  localparam [9:0] NATIVE_VSYNC_END = 10'd727;
 
   localparam [1:0] STATE_SEARCH = 2'd0;
   localparam [1:0] STATE_PREFILL = 2'd1;
@@ -167,6 +181,18 @@ module video_transport_54 #(
 
   reg [1:0] state = STATE_SEARCH;
   assign running = state == STATE_RUN;
+  // The native producer runs exactly 5,437.5 packets/s faster than the fixed
+  // 32.768 MHz consumer. Pause it with wide hysteresis so sparse hardware
+  // write/service gaps cannot drain the FIFO, while the framework-visible
+  // raster remains free-running and exact. The read-domain count is already
+  // synchronized by dcfifo; the 128-word band easily covers pause CDC delay.
+  reg native_run_pause = 1'b0;
+`ifdef CORE_DIAGNOSTIC_TRANSPORT_STATE
+  // Latched hardware-only recovery cause. This remains visible throughout
+  // SEARCH/PREFILL/ALIGN so a scaler screenshot can identify a one-cycle
+  // trigger long after the offending edge.
+  reg [2:0] diagnostic_fault_reason = 3'd0;
+`endif
 
   // CRT CE is an exact /8. Native is the exact rational NCO 2048/3375.
   reg [2:0] crt_divider = 3'd0;
@@ -176,45 +202,42 @@ module video_transport_54 #(
   wire [12:0] native_remainder = native_sum - 13'd3375;
   wire crt_ce_raw = crt_divider == 3'd7;
   wire selected_ce_raw = active_crt ? crt_ce_raw : native_ce_raw;
-  // SEARCH and PREFILL need source pixels. ALIGN deliberately pauses the
-  // source with SOF at the FIFO head until the free-running output reaches
-  // its own frame boundary; RUN then requests and consumes one packet per CE.
+  // SEARCH and PREFILL need source pixels. ALIGN holds the FIFO head on SOF;
+  // RUN uses occupancy hysteresis to absorb rare source-side service gaps.
+  // CRT already stops receiving returned output ticks.
   wire request_crt_source = active_crt && !hold_sync && !fifo_aclr &&
       state != STATE_ALIGN;
-  reg blank_commit_pending = 1'b0;
-  wire blank_transition_ce;
-  // Once CRT mode is active, its externally visible cadence and raster never
-  // stop for packet-FIFO search, prefill, hold, or recovery. A content fault
-  // may black RGB, but it must not stretch a line/frame or suppress sync; the
-  // framework and downstream Direct Video equipment measure those edges.
-  // Native mode retains the packet-driven behavior because it is supported
-  // through the normal MiSTer scaler rather than raw Direct Video.
-  assign ce_pixel = active_crt ? crt_ce_raw :
-      (!fifo_aclr &&
-       ((running && !hold_sync && selected_ce_raw) || blank_transition_ce));
+  assign native_source_pause = !active_crt &&
+      (state == STATE_ALIGN || native_run_pause);
+
+  // Raster cadence is never gated by packet availability, hold, or recovery.
+  // This is the central invariant that keeps MiSTer's scaler line and frame
+  // accounting stable even if RGB must be black until the next clean SOF.
+  assign ce_pixel = selected_ce_raw;
 
   reg [10:0] crt_x = 11'd0;
   reg [9:0] crt_y = 10'd0;
+  reg [10:0] native_x = 11'd0;
+  reg [9:0] native_y = 10'd0;
   wire mode_changed = crt_mode_sync != active_crt;
   wire hold_started = hold_sync && !hold_prev;
   wire overflow_event = overflow_sync != overflow_seen;
   wire prefill_ready = packet_level_video >= PREFILL_WORDS;
   wire control_event = mode_changed || hold_started || overflow_event;
-  // A control event can arrive between normal pixel CEs. Export CE on the edge
-  // that changes the registers to blank, then retain a pending CE through the
-  // FIFO flush and emit it once more with blank already stable. The second CE
-  // lets downstream CE-gated framework stages actually capture that blank
-  // under nonblocking sequential semantics.
-  assign blank_transition_ce =
-      (state == STATE_RUN && control_event) || blank_commit_pending;
+  wire local_sof = active_crt ?
+      (crt_x == 11'd0 && crt_y == 10'd0) :
+      (native_x == 11'd0 && native_y == 10'd0);
+  wire packet_phase_good = fifo_q[PACKET_SOF] == local_sof;
 
   // dcfifo samples rdreq on the same edge on which the bridge consumes the
-  // show-ahead q word. Keeping this request combinational is required for
-  // adjacent native CEs; registering it would repeat a packet in that case.
+  // show-ahead q word. Keep this request combinational so the consumed packet
+  // and the exported CE refer to the same edge.
+  // Both modes acquire a complete source frame. Discard until SOF, hold that
+  // word through PREFILL, then align it to the output-owned frame boundary.
   wire search_discard = state == STATE_SEARCH && !fifo_aclr && !hold_sync &&
       !control_event && !fifo_empty && !fifo_q[PACKET_SOF];
   wire run_consume = state == STATE_RUN && selected_ce_raw && !fifo_aclr &&
-      !hold_sync && !control_event && !fifo_empty;
+      !hold_sync && !control_event && !fifo_empty && packet_phase_good;
   assign fifo_rdreq = search_discard || run_consume;
 
   always @(posedge clk_video_54 or posedge reset) begin
@@ -231,12 +254,17 @@ module video_transport_54 #(
       crt_source_tick_toggle <= 1'b0;
       flush_count <= FLUSH_RELOAD;
       state <= STATE_SEARCH;
+      native_run_pause <= 1'b0;
       fault <= 1'b0;
+`ifdef CORE_DIAGNOSTIC_TRANSPORT_STATE
+      diagnostic_fault_reason <= 3'd0;
+`endif
       crt_divider <= 3'd0;
       native_accumulator <= 12'd0;
       crt_x <= 11'd0;
       crt_y <= 10'd0;
-      blank_commit_pending <= 1'b0;
+      native_x <= 11'd0;
+      native_y <= 10'd0;
       hsync <= 1'b0;
       vsync <= 1'b0;
       hblank <= 1'b1;
@@ -252,21 +280,22 @@ module video_transport_54 #(
       overflow_sync <= overflow_meta;
       hold_prev <= hold_sync;
 
+      if (active_crt || state != STATE_RUN || fifo_aclr || control_event ||
+          fifo_empty) begin
+        native_run_pause <= 1'b0;
+      end else if (!native_run_pause && packet_level_video >= 10'd768) begin
+        native_run_pause <= 1'b1;
+      end else if (native_run_pause && packet_level_video <= 10'd640) begin
+        native_run_pause <= 1'b0;
+      end
+
       if (request_crt_source && crt_ce_raw) begin
         crt_source_tick_toggle <= !crt_source_tick_toggle;
       end
 
-      if (blank_commit_pending && !fifo_aclr) begin
-        blank_commit_pending <= 1'b0;
-      end
-
       if (active_crt) begin
-        // CRT timing is output-owned and free-running. Packet availability
-        // never resets this divider or the raster counters below.
+        // Packet availability never resets either output pacing phase.
         crt_divider <= crt_divider + 3'd1;
-        native_accumulator <= 12'd0;
-      end else if (state != STATE_RUN || hold_sync || fifo_aclr) begin
-        crt_divider <= 3'd0;
         native_accumulator <= 12'd0;
       end else begin
         crt_divider <= 3'd0;
@@ -283,12 +312,23 @@ module video_transport_54 #(
         flush_count <= FLUSH_RELOAD;
         state <= STATE_SEARCH;
         fault <= overflow_event;
-        if (!active_crt) begin
-          crt_x <= 11'd0;
-          crt_y <= 10'd0;
+`ifdef CORE_DIAGNOSTIC_TRANSPORT_STATE
+        if (overflow_event) begin
+          diagnostic_fault_reason <= 3'd3;
+        end else if (hold_started) begin
+          diagnostic_fault_reason <= 3'd2;
+        end else begin
+          diagnostic_fault_reason <= 3'd1;
         end
-        if (state == STATE_RUN) begin
-          blank_commit_pending <= 1'b1;
+`endif
+        if (mode_changed) begin
+          if (crt_mode_sync) begin
+            crt_x <= 11'd0;
+            crt_y <= 10'd0;
+          end else begin
+            native_x <= 11'd0;
+            native_y <= 10'd0;
+          end
         end
         hsync <= 1'b0;
         vsync <= 1'b0;
@@ -322,11 +362,8 @@ module video_transport_54 #(
             vblank <= 1'b1;
             de <= 1'b0;
             rgb <= 24'd0;
-            if (!fifo_empty) begin
-              if (fifo_q[PACKET_SOF]) begin
-                state <= STATE_PREFILL;
-              end else begin
-              end
+            if (!fifo_empty && fifo_q[PACKET_SOF]) begin
+              state <= STATE_PREFILL;
             end
           end
 
@@ -339,28 +376,39 @@ module video_transport_54 #(
             rgb <= 24'd0;
             if (fifo_empty) begin
               state <= STATE_SEARCH;
+`ifdef CORE_DIAGNOSTIC_TRANSPORT_STATE
+              diagnostic_fault_reason <= 3'd4;
+`endif
             end else if (!fifo_q[PACKET_SOF]) begin
               state <= STATE_SEARCH;
+`ifdef CORE_DIAGNOSTIC_TRANSPORT_STATE
+              diagnostic_fault_reason <= 3'd5;
+`endif
             end else if (prefill_ready) begin
-              // Native timing comes from the packet and may start now. CRT
-              // timing is output-owned, so hold the source SOF and wait for
-              // the local frame boundary before revealing or consuming it.
-              state <= active_crt ? STATE_ALIGN : STATE_RUN;
-              if (!active_crt) fault <= 1'b0;
+              // Hold source SOF while the local raster completes its current
+              // black frame. Both modes enter RUN only at their own origin.
+              state <= STATE_ALIGN;
             end
           end
 
           STATE_ALIGN: begin
-            // The CRT counters and sync continue in the unconditional block
+            // The local counters and sync continue in the unconditional block
             // below. RGB stays black and the FIFO head stays on source SOF.
-            // Stopping source requests in this state prevents the FIFO from
+            // Pausing source progress in this state prevents the FIFO from
             // filling while waiting up to one output frame for alignment.
             if (fifo_empty || !fifo_q[PACKET_SOF]) begin
               state <= STATE_SEARCH;
               fault <= 1'b1;
-            end else if (crt_ce_raw &&
-                         crt_x == CRT_TOTAL_X - 11'd1 &&
-                         crt_y == CRT_TOTAL_Y - 10'd1) begin
+`ifdef CORE_DIAGNOSTIC_TRANSPORT_STATE
+              diagnostic_fault_reason <= fifo_empty ? 3'd4 : 3'd5;
+`endif
+            end else if (selected_ce_raw &&
+                         ((active_crt &&
+                           crt_x == CRT_TOTAL_X - 11'd1 &&
+                           crt_y == CRT_TOTAL_Y - 10'd1) ||
+                          (!active_crt &&
+                           native_x == NATIVE_TOTAL_X - 11'd1 &&
+                           native_y == NATIVE_TOTAL_Y - 10'd1))) begin
               state <= STATE_RUN;
               fault <= 1'b0;
             end
@@ -368,14 +416,12 @@ module video_transport_54 #(
 
           STATE_RUN: begin
             if (selected_ce_raw) begin
-              if (fifo_empty) begin
+              if (fifo_empty || !packet_phase_good) begin
                 state <= STATE_SEARCH;
                 fault <= 1'b1;
-                blank_commit_pending <= 1'b1;
-                if (!active_crt) begin
-                  crt_x <= 11'd0;
-                  crt_y <= 10'd0;
-                end
+`ifdef CORE_DIAGNOSTIC_TRANSPORT_STATE
+                diagnostic_fault_reason <= fifo_empty ? 3'd4 : 3'd5;
+`endif
                 hsync <= 1'b0;
                 vsync <= 1'b0;
                 hblank <= 1'b1;
@@ -399,25 +445,34 @@ module video_transport_54 #(
           default: begin
             state <= STATE_SEARCH;
             fault <= 1'b1;
+`ifdef CORE_DIAGNOSTIC_TRANSPORT_STATE
+            diagnostic_fault_reason <= 3'd7;
+`endif
           end
         endcase
       end
 
-      // Give the CRT raster final ownership of the externally visible video
-      // registers and its counters. Earlier state-machine assignments may
-      // blank/rearm native output, but they cannot alter CRT timing between
-      // enables or reset the scan position during a FIFO recovery episode.
+      // Give the output-owned raster final priority over every state-machine
+      // blank/recovery assignment above. Controls and counters never jump on
+      // packet loss; only RGB changes to black until aligned RUN resumes.
+      hsync <= hsync;
+      vsync <= vsync;
+      hblank <= hblank;
+      vblank <= vblank;
+      de <= de;
+      rgb <= rgb;
+      crt_x <= crt_x;
+      crt_y <= crt_y;
+      native_x <= native_x;
+      native_y <= native_y;
+
+      if (state != STATE_RUN || hold_sync || fifo_aclr || control_event) begin
+        rgb <= 24'd0;
+      end
+
       if (active_crt) begin
-        // Hold every CRT output stable between enables even when SEARCH,
-        // PREFILL, or flush logic above requests a content blank.
-        hsync <= hsync;
-        vsync <= vsync;
-        hblank <= hblank;
-        vblank <= vblank;
-        de <= de;
-        rgb <= rgb;
-        crt_x <= crt_x;
-        crt_y <= crt_y;
+        native_x <= 11'd0;
+        native_y <= 10'd0;
         if (crt_ce_raw) begin
           hsync <= crt_x >= CRT_HSYNC_START && crt_x < CRT_HSYNC_END;
           vsync <= crt_y >= CRT_VSYNC_START && crt_y < CRT_VSYNC_END;
@@ -425,7 +480,7 @@ module video_transport_54 #(
           vblank <= crt_y >= CRT_ACTIVE_Y;
           de <= crt_x < CRT_ACTIVE_X && crt_y < CRT_ACTIVE_Y;
           rgb <= state == STATE_RUN && !hold_sync && !fifo_aclr &&
-                     !control_event && !fifo_empty &&
+                     !control_event && !fifo_empty && packet_phase_good &&
                      crt_x < CRT_ACTIVE_X && crt_y < CRT_ACTIVE_Y ?
                  fifo_q[23:0] : 24'd0;
 
@@ -438,6 +493,67 @@ module video_transport_54 #(
             end
           end else begin
             crt_x <= crt_x + 11'd1;
+          end
+        end
+      end else begin
+        crt_x <= 11'd0;
+        crt_y <= 10'd0;
+        if (native_ce_raw) begin
+          hsync <= native_x >= NATIVE_HSYNC_START &&
+              native_x < NATIVE_HSYNC_END;
+          vsync <= native_y >= NATIVE_VSYNC_START &&
+              native_y < NATIVE_VSYNC_END;
+          hblank <= native_x >= NATIVE_ACTIVE_X;
+          vblank <= native_y >= NATIVE_ACTIVE_Y;
+          de <= native_x < NATIVE_ACTIVE_X && native_y < NATIVE_ACTIVE_Y;
+`ifdef CORE_DIAGNOSTIC_TRANSPORT_STATE
+          // Hardware-only state probe for intermittent native blanking. The
+          // normal RUN path remains unmodified, while recovery states replace
+          // black active pixels with unmistakable solid colors:
+          // SEARCH=red, PREFILL=green, ALIGN=blue, invalid RUN=magenta.
+          // Keep this macro disabled in every release build.
+          if (native_x < NATIVE_ACTIVE_X && native_y < NATIVE_ACTIVE_Y) begin
+            if (state == STATE_RUN) begin
+              rgb <= !hold_sync && !fifo_aclr && !control_event &&
+                             !fifo_empty && packet_phase_good ?
+                         (native_x < 11'd8 ? 24'h00ffff : fifo_q[23:0]) :
+                         (fifo_empty ? 24'hffff00 : 24'hff00ff);
+            end else if (diagnostic_fault_reason != 3'd0) begin
+              case (diagnostic_fault_reason)
+                3'd1: rgb <= 24'hffffff;  // Mode change.
+                3'd2: rgb <= 24'h808080;  // Hold started.
+                3'd3: rgb <= 24'hff8000;  // FIFO overflow/high water.
+                3'd4: rgb <= 24'hffff00;  // FIFO empty.
+                3'd5: rgb <= 24'hff00ff;  // SOF phase mismatch.
+                default: rgb <= 24'h8000ff;
+              endcase
+            end else begin
+              case (state)
+                STATE_SEARCH: rgb <= 24'hff0000;
+                STATE_PREFILL: rgb <= 24'h00ff00;
+                STATE_ALIGN: rgb <= 24'h0000ff;
+                default: rgb <= 24'h8000ff;
+              endcase
+            end
+          end else begin
+            rgb <= 24'd0;
+          end
+`else
+          rgb <= state == STATE_RUN && !hold_sync && !fifo_aclr &&
+                     !control_event && !fifo_empty && packet_phase_good &&
+                     native_x < NATIVE_ACTIVE_X &&
+                     native_y < NATIVE_ACTIVE_Y ? fifo_q[23:0] : 24'd0;
+`endif
+
+          if (native_x == NATIVE_TOTAL_X - 11'd1) begin
+            native_x <= 11'd0;
+            if (native_y == NATIVE_TOTAL_Y - 10'd1) begin
+              native_y <= 10'd0;
+            end else begin
+              native_y <= native_y + 10'd1;
+            end
+          end else begin
+            native_x <= native_x + 11'd1;
           end
         end
       end

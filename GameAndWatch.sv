@@ -83,6 +83,8 @@ module emu (
     "O[5:2],Inactive LCD Alpha,Off,5%,10%,20%,30%,40%,50%,60%,70%,80%,90%,100%;",
     "-;",
     "O[1],Accurate LCD Timing,Off,On;",
+    "-;",
+    "O[11],Audio,On,Mute;",
 `ifdef CORE_ENABLE_DEBUG_OVERLAY
     "-;",
     "O[6],Debug Video,Off,On;",
@@ -287,6 +289,7 @@ module emu (
   end
 
   wire signed [15:0] core_audio;
+  wire audio_muted = status[11];
   wire source_vsync;
   wire source_hsync;
   wire source_vblank;
@@ -297,6 +300,7 @@ module emu (
   wire source_packet_wr;
   wire [29:0] source_packet;
   wire crt_source_tick_toggle;
+  wire native_source_pause;
   wire source_video_held;
 
   wire vsync;
@@ -375,6 +379,7 @@ module emu (
       .crt_video(crt_video),
       .hold_video(hold_video),
       .crt_source_tick_async(crt_source_tick_toggle),
+      .native_source_pause_async(native_source_pause),
 
       .debug_video(debug_video),
       .debug_view(debug_view),
@@ -412,6 +417,7 @@ module emu (
       .packet_level_source(transport_packet_level_source),
       .packet_level_video(transport_packet_level_video),
       .crt_source_tick_toggle(crt_source_tick_toggle),
+      .native_source_pause(native_source_pause),
       .ce_pixel(ce_pix),
       .hsync(hsync),
       .vsync(vsync),
@@ -442,7 +448,7 @@ module emu (
   assign VGA_SL = 2'b00;
 
   assign AUDIO_S = 1;
-  assign AUDIO_L = core_audio;
+  assign AUDIO_L = audio_muted ? 16'sd0 : core_audio;
   assign AUDIO_R = AUDIO_L;
 
 endmodule

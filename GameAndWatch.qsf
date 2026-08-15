@@ -61,6 +61,12 @@ set_global_assignment -name SEED 1
 # Optional diagnostic grid and its OSD controls. Keep disabled in release builds.
 #set_global_assignment -name VERILOG_MACRO "CORE_ENABLE_DEBUG_OVERLAY=1"
 
+# Hardware A/B: coordinate pixels with artwork SDRAM reads disabled.
+#set_global_assignment -name VERILOG_MACRO "CORE_DIAGNOSTIC_VIDEO_PATTERN=1"
+
+# Hardware-only transport state colors; never enable for a release build.
+#set_global_assignment -name VERILOG_MACRO "CORE_DIAGNOSTIC_TRANSPORT_STATE=1"
+
 # disable bilinear filtering when downscaling
 #set_global_assignment -name VERILOG_MACRO "MISTER_DOWNSCALE_NN=1"
 

@@ -9,6 +9,7 @@ module sm510 (
 
     // The type of CPU being implemented
     input wire [3:0] cpu_id,
+    input wire       default_sound_on,
 
     // Data for external ROM
     // NOTE: rom_data is expected to be updated with clk_en, and not run at a higher clock
@@ -297,6 +298,7 @@ module sm510 (
       .reset(reset),
 
       .cpu_id(cpu_id),
+      .default_sound_on(default_sound_on),
 
       // While temp_sbm is set, we operate as if the highest bit is high, rather than its current value
       .addr(ram_addr_with_masks),

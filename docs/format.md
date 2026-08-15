@@ -40,7 +40,7 @@ Versions 1 and 2 share the fixed fields below. Multi-byte size, offset, length, 
 0xF9  generator commit prefix: seven lowercase ASCII hex bytes, or "unknown"
 ```
 
-The provenance field never contains a build-tool sentinel. If a Git commit cannot be determined, the generator writes the explicit seven-byte value `unknown`. The current regenerated packages contain `2600ff1`, which was the committed `HEAD` while they were generated from a large dirty worktree. It identifies the nearest committed revision only; it does not mean the generator, RTL, or package changes described here are present in commit `2600ff1`.
+The provenance field never contains a build-tool sentinel. If a Git commit cannot be determined, the generator writes the explicit seven-byte value `unknown`. The current refreshed packages contain `2627bd8`, the committed `HEAD` used to build the header-refresh tool. It identifies the nearest committed revision only; it does not mean the generator, RTL, or package changes described here are present in commit `2627bd8`.
 
 ### Feature Flags
 
@@ -51,9 +51,12 @@ The provenance field never contains a build-tool sentinel. If a Git commit canno
 | 2 | `0x04` | Player-two electrical-cell ownership mask |
 | 3 | `0x08` | Native CRT image payload |
 | 4 | `0x10` | Native CRT mask payload |
+| 5 | `0x20` | SM530 default-sound compatibility behavior |
 | 7 | `0x80` | `GNWX` extension directory present |
 
 Bits 3 and 4 are a pair. The core enables the native CRT asset bank only when both canonical descriptors and both complete payload streams validate.
+
+Bit 5 is descriptorless metadata. For the current Nelsonic Super Mario Bros. 3 package, it presents firmware RAM `0x37` bit 3 as set on SM530 CPU reads so the unmodified program follows its existing `SME` path. Stored RAM, program ROM, and melody ROM bytes are unchanged. Older cores ignore the flag and retain the authentic default-silent behavior.
 
 Voice-only V2 packages produced before `GNWX` remain compatible. A current dual-resolution package necessarily has a directory; when it also contains voice data, the directory includes a voice descriptor.
 
