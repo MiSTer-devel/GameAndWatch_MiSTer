@@ -37,6 +37,7 @@ pub(crate) const FEATURE_HMC: u8 = 0x02;
 pub(crate) const FEATURE_PLAYER_TWO: u8 = 0x04;
 pub(crate) const FEATURE_CRT_IMAGE: u8 = 0x08;
 pub(crate) const FEATURE_CRT_MASK: u8 = 0x10;
+pub(crate) const FEATURE_DEFAULT_SOUND_ON: u8 = 0x20;
 pub(crate) const FEATURE_DIRECTORY: u8 = 0x80;
 
 const DIRECTORY_MAGIC_OFFSET: usize = 0x31;
@@ -453,12 +454,18 @@ pub(crate) fn build_config(
         }
     }
     let has_crt_assets = crt_mask_used_length.is_some();
+    let has_default_sound_on = platform.default_sound_on.unwrap_or(false);
     let player_two_mask = build_player_two_mask(platform)?;
     let has_player_two = player_two_mask.iter().any(|byte| *byte != 0);
     let has_directory = has_hmc || has_player_two || has_crt_assets;
     let mut config = Vec::<u8>::with_capacity(0x100);
     // Version
-    config.push(if has_voice || has_hmc || has_player_two || has_crt_assets {
+    config.push(if has_voice
+        || has_hmc
+        || has_player_two
+        || has_crt_assets
+        || has_default_sound_on
+    {
         2
     } else {
         1
@@ -627,6 +634,9 @@ pub(crate) fn build_config(
     }
     if has_crt_assets {
         feature_flags |= FEATURE_CRT_IMAGE | FEATURE_CRT_MASK;
+    }
+    if has_default_sound_on {
+        feature_flags |= FEATURE_DEFAULT_SOUND_ON;
     }
     if has_directory {
         feature_flags |= FEATURE_DIRECTORY;
@@ -985,9 +995,9 @@ mod tests {
         build_config, build_crt_mask_map, encode, generator_stamp, is_valid_generator_stamp,
         CRT_IMAGE_HEIGHT, CRT_IMAGE_PACKAGE_OFFSET, CRT_IMAGE_SIZE, CRT_IMAGE_WIDTH,
         CRT_MASK_CAPACITY, CRT_MASK_PACKAGE_OFFSET, CRT_PACKAGE_SIZE, FEATURE_CRT_IMAGE,
-        FEATURE_CRT_MASK, FEATURE_DIRECTORY, FEATURE_HMC, FEATURE_PLAYER_TWO, FEATURE_VOICE,
-        HMC_PACKAGE_OFFSET, HMC_ROM_SIZE, PLAYER_TWO_MASK_OFFSET, VOICE_BANK_SIZE,
-        VOICE_PACKAGE_OFFSET,
+        FEATURE_CRT_MASK, FEATURE_DEFAULT_SOUND_ON, FEATURE_DIRECTORY, FEATURE_HMC,
+        FEATURE_PLAYER_TWO, FEATURE_VOICE, HMC_PACKAGE_OFFSET, HMC_ROM_SIZE,
+        PLAYER_TWO_MASK_OFFSET, VOICE_BANK_SIZE, VOICE_PACKAGE_OFFSET,
     };
     use crate::manifest::PlatformSpecification;
     use crate::{HEIGHT, WIDTH};
@@ -1021,6 +1031,19 @@ mod tests {
             }"#,
         )
         .expect("could not parse player-two fixture")
+    }
+
+    fn default_sound_platform() -> PlatformSpecification {
+        serde_json::from_str(
+            r#"{
+                "device":{"cpu":"sm530","screen":{"type":"single","width":1203,"height":1080}},
+                "portMap":{"ports":[]},
+                "metadata":{"year":"1990","company":"Nelsonic","name":"Super Mario Bros. 3 (Nelsonic)"},
+                "rom":{"rom":"633.program","melody":"633.melody","melodyHash":"94b5865fc669b7f6487845647866c06f4f581f63","romHash":"1271d15e6168d73852f8ade9ade4d5f3b1838bf5"},
+                "defaultSoundOn":true
+            }"#,
+        )
+        .expect("could not parse startup-sound fixture")
     }
 
     #[test]
@@ -1096,6 +1119,16 @@ mod tests {
             &[0x04, 0x0c, 0x0c, 0x00, 0x00]
         );
         assert!(config[0x3d..0xf9].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn default_sound_on_is_a_descriptorless_v2_feature() {
+        let config = build_config(&default_sound_platform(), false, false, None).unwrap();
+
+        assert_eq!(config.len(), 0x100);
+        assert_eq!(config[0], 2);
+        assert_eq!(config[0x30], FEATURE_DEFAULT_SOUND_ON);
+        assert!(config[0x31..0xf9].iter().all(|byte| *byte == 0));
     }
 
     #[test]

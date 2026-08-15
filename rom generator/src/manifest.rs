@@ -12,6 +12,12 @@ pub struct PlatformSpecification {
     pub unsupported_reason: Option<String>,
     pub voice: Option<VoiceDefinition>,
     pub aux_rom: Option<AuxROMDefinition>,
+    /// Optional preferred subdirectory under the artwork root. If the
+    /// alternate is absent, generation falls back to the standard title ZIP.
+    pub artwork_subdirectory: Option<String>,
+    /// Request the SM530 startup-sound compatibility behavior for titles
+    /// whose firmware otherwise boots with melody disabled.
+    pub default_sound_on: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]

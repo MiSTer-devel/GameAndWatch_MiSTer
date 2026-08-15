@@ -77,6 +77,10 @@ export interface PlatformSpecification {
   unsupportedReason?: string;
   voice?: VoiceDefinition;
   auxRom?: AuxROMDefinition;
+  /** Preferred folder below the artwork root, with standard ZIP fallback. */
+  artworkSubdirectory?: string;
+  /** Enable the package-declared SM530 startup-sound compatibility behavior. */
+  defaultSoundOn?: boolean;
 }
 
 export type AuxROMDefinition = {

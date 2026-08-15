@@ -2,7 +2,7 @@
 extern crate guard;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env::temp_dir,
     fs::{self, OpenOptions},
     io::{Seek, SeekFrom, Write},
@@ -25,8 +25,8 @@ use crate::{
         CRT_MASK_CAPACITY, CRT_MASK_PACKAGE_OFFSET, CRT_PACKAGE_SIZE,
         DESCRIPTOR_KIND_CRT_IMAGE, DESCRIPTOR_KIND_CRT_MASK, DESCRIPTOR_KIND_HMC,
         DESCRIPTOR_KIND_VOICE, FEATURE_CRT_IMAGE, FEATURE_CRT_MASK, FEATURE_DIRECTORY,
-        FEATURE_HMC, FEATURE_PLAYER_TWO, FEATURE_VOICE, HMC_PACKAGE_OFFSET, HMC_ROM_SIZE,
-        VOICE_PACKAGE_OFFSET,
+        FEATURE_DEFAULT_SOUND_ON, FEATURE_HMC, FEATURE_PLAYER_TWO, FEATURE_VOICE,
+        HMC_PACKAGE_OFFSET, HMC_ROM_SIZE, VOICE_PACKAGE_OFFSET,
     },
     manifest::{AuxROMDefinition, AuxROMRegion, AuxROMType, CPUType},
     render::{RenderTarget, RenderedData},
@@ -79,6 +79,14 @@ struct Args {
     #[arg(long)]
     /// Refresh fixed package headers from the manifest without rerendering assets
     refresh_package_configs: bool,
+
+    #[arg(long)]
+    /// Repair invisible per-segment LCD foregrounds in already-generated packages
+    repair_lcd_contrast: bool,
+
+    #[arg(long)]
+    /// Report package LCD foregrounds that the contrast repair would change
+    audit_lcd_contrast: bool,
 
     #[command(subcommand)]
     filter: Option<FilterArg>,
@@ -165,6 +173,24 @@ fn main() {
     if args.refresh_package_configs {
         if let Err(error) = refresh_package_configs(&manifest, &args.output_path) {
             eprintln!("Package config refresh failed: {error}");
+            std::process::exit(1);
+        }
+        if !args.validate_packages {
+            return;
+        }
+    }
+
+    if args.repair_lcd_contrast || args.audit_lcd_contrast {
+        if args.repair_lcd_contrast && args.audit_lcd_contrast {
+            eprintln!("Choose either --repair-lcd-contrast or --audit-lcd-contrast, not both");
+            std::process::exit(1);
+        }
+        if let Err(error) = repair_package_lcd_contrast(
+            &manifest,
+            &args.output_path,
+            args.repair_lcd_contrast,
+        ) {
+            eprintln!("Package LCD-contrast repair failed: {error}");
             std::process::exit(1);
         }
         if !args.validate_packages {
@@ -341,6 +367,7 @@ fn main() {
             platform.parent.as_deref(),
             &platform.rom.rom_owner,
             &artwork_path,
+            platform.artwork_subdirectory.as_deref(),
             &rom_path,
             sample_path.as_deref(),
             platform.voice.as_ref().map(|voice| voice.sample_set.as_str()),
@@ -457,6 +484,259 @@ fn main() {
 const IMAGE_AND_MASK_SIZE: usize = 0x325240;
 const PROGRAM_ROM_SIZE: usize = 0x1000;
 const MELODY_ROM_SIZE: usize = 0x100;
+const LEGACY_IMAGE_PACKAGE_OFFSET: usize = 0x100;
+const LEGACY_MASK_PACKAGE_OFFSET: usize = LEGACY_IMAGE_PACKAGE_OFFSET + WIDTH * HEIGHT * 6;
+const LEGACY_MASK_CAPACITY: usize = IMAGE_AND_MASK_SIZE - LEGACY_MASK_PACKAGE_OFFSET;
+
+#[derive(Clone, Copy, Debug)]
+struct PackageMaskRun {
+    id: u16,
+    x: usize,
+    y: usize,
+    length: usize,
+}
+
+fn decode_package_mask_runs(
+    package: &[u8],
+    mask_offset: usize,
+    mask_capacity: usize,
+    width: usize,
+    height: usize,
+    label: &str,
+) -> Result<Vec<PackageMaskRun>, String> {
+    let mask_end = mask_offset
+        .checked_add(mask_capacity)
+        .ok_or_else(|| format!("{label} mask bounds overflowed"))?;
+    let region = package
+        .get(mask_offset..mask_end)
+        .ok_or_else(|| format!("Package is missing its {label} mask region"))?;
+    let mut runs = Vec::new();
+    let mut previous_y = 0usize;
+    let mut previous_end_x = 0usize;
+    let mut have_previous = false;
+
+    for (entry_index, entry) in region.chunks_exact(5).enumerate() {
+        if entry.iter().all(|byte| *byte == 0) {
+            break;
+        }
+
+        let packed = u64::from(entry[0])
+            | (u64::from(entry[1]) << 8)
+            | (u64::from(entry[2]) << 16)
+            | (u64::from(entry[3]) << 24)
+            | (u64::from(entry[4]) << 32);
+        let id = (packed & 0x3ff) as u16;
+        let x = ((packed >> 10) & 0x3ff) as usize;
+        let y = ((packed >> 20) & 0x3ff) as usize;
+        let length = ((packed >> 30) & 0x3ff) as usize;
+        let end_x = x + length;
+        if length == 0 || y >= height || end_x > width {
+            return Err(format!(
+                "Package has an invalid {label} mask run at entry {entry_index}"
+            ));
+        }
+        if have_previous && (y < previous_y || (y == previous_y && x < previous_end_x)) {
+            return Err(format!(
+                "Package has out-of-order or overlapping {label} mask runs"
+            ));
+        }
+        runs.push(PackageMaskRun { id, x, y, length });
+        previous_y = y;
+        previous_end_x = end_x;
+        have_previous = true;
+    }
+
+    if runs.is_empty() {
+        return Err(format!("Package {label} mask has no segment runs"));
+    }
+    Ok(runs)
+}
+
+fn repair_image_lcd_contrast(
+    package: &mut [u8],
+    image_offset: usize,
+    width: usize,
+    height: usize,
+    mask_offset: usize,
+    mask_capacity: usize,
+    label: &str,
+) -> Result<(usize, usize), String> {
+    let image_size = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(6))
+        .ok_or_else(|| format!("{label} image dimensions overflowed"))?;
+    if package.get(image_offset..image_offset + image_size).is_none() {
+        return Err(format!("Package is missing its {label} image region"));
+    }
+    let runs = decode_package_mask_runs(
+        package,
+        mask_offset,
+        mask_capacity,
+        width,
+        height,
+        label,
+    )?;
+    let mut stats: HashMap<u16, (usize, usize)> = HashMap::new();
+
+    for run in &runs {
+        for x in run.x..run.x + run.length {
+            let pixel = image_offset + (run.y * width + x) * 6;
+            let delta = usize::from(package[pixel].abs_diff(package[pixel + 1]))
+                + usize::from(package[pixel + 2].abs_diff(package[pixel + 3]))
+                + usize::from(package[pixel + 4].abs_diff(package[pixel + 5]));
+            let stat = stats.entry(run.id).or_insert((0, 0));
+            stat.0 += 1;
+            stat.1 += delta;
+        }
+    }
+
+    let low_contrast: HashSet<u16> = stats
+        .iter()
+        .filter_map(|(id, (pixels, delta))| {
+            (*pixels != 0 && *delta <= *pixels * 3).then_some(*id)
+        })
+        .collect();
+    let mut repaired_ids = HashSet::new();
+    let mut repaired_pixels = 0usize;
+    for run in &runs {
+        if !low_contrast.contains(&run.id) {
+            continue;
+        }
+        for x in run.x..run.x + run.length {
+            let pixel = image_offset + (run.y * width + x) * 6;
+            let replacement = [
+                (u16::from(package[pixel]) * 45 / 100) as u8,
+                (u16::from(package[pixel + 2]) * 45 / 100) as u8,
+                (u16::from(package[pixel + 4]) * 45 / 100) as u8,
+            ];
+            if package[pixel + 1] != replacement[0]
+                || package[pixel + 3] != replacement[1]
+                || package[pixel + 5] != replacement[2]
+            {
+                package[pixel + 1] = replacement[0];
+                package[pixel + 3] = replacement[1];
+                package[pixel + 5] = replacement[2];
+                repaired_ids.insert(run.id);
+                repaired_pixels += 1;
+            }
+        }
+    }
+
+    Ok((repaired_ids.len(), repaired_pixels))
+}
+
+fn repair_package_lcd_contrast(
+    manifest: &HashMap<String, PlatformSpecification>,
+    output_path: &Path,
+    write_changes: bool,
+) -> Result<(), String> {
+    let supported = supported_platforms(manifest);
+    validate_package_directory_inventory(&supported, output_path)?;
+    let mut repaired_packages = 0usize;
+    let mut repaired_segments = 0usize;
+    let mut repaired_pixels = 0usize;
+
+    for (_, platform) in supported {
+        let file_name = package_file_name(platform);
+        let package_path = output_path.join(package_relative_path(platform));
+        let mut package = fs::read(&package_path)
+            .map_err(|err| format!("Could not read {package_path:?}: {err}"))?;
+        validate_package(&file_name, &package, platform)?;
+
+        let legacy = repair_image_lcd_contrast(
+            &mut package,
+            LEGACY_IMAGE_PACKAGE_OFFSET,
+            WIDTH,
+            HEIGHT,
+            LEGACY_MASK_PACKAGE_OFFSET,
+            LEGACY_MASK_CAPACITY,
+            "legacy",
+        )?;
+        let crt = repair_image_lcd_contrast(
+            &mut package,
+            CRT_IMAGE_PACKAGE_OFFSET,
+            CRT_IMAGE_WIDTH,
+            CRT_IMAGE_HEIGHT,
+            CRT_MASK_PACKAGE_OFFSET,
+            CRT_MASK_CAPACITY,
+            "CRT",
+        )?;
+        let package_segments = legacy.0 + crt.0;
+        let package_pixels = legacy.1 + crt.1;
+        if package_segments == 0 {
+            continue;
+        }
+
+        validate_package(&file_name, &package, platform)?;
+        if !write_changes {
+            println!(
+                "Would repair {file_name}: {package_segments} low-contrast segment layers / {package_pixels} pixels"
+            );
+            repaired_packages += 1;
+            repaired_segments += package_segments;
+            repaired_pixels += package_pixels;
+            continue;
+        }
+        let mut temporary_name = package_path
+            .file_name()
+            .ok_or_else(|| format!("Package path {package_path:?} has no filename"))?
+            .to_os_string();
+        temporary_name.push(format!(".lcd-contrast-{}.tmp", std::process::id()));
+        let temporary_path = package_path.with_file_name(temporary_name);
+        if temporary_path.exists() {
+            return Err(format!(
+                "Refusing to overwrite stale repair file {temporary_path:?}"
+            ));
+        }
+        let mut backup_name = package_path
+            .file_name()
+            .expect("package filename was checked above")
+            .to_os_string();
+        backup_name.push(format!(".lcd-contrast-{}.bak", std::process::id()));
+        let backup_path = package_path.with_file_name(backup_name);
+        if backup_path.exists() {
+            return Err(format!(
+                "Refusing to overwrite stale repair backup {backup_path:?}"
+            ));
+        }
+        fs::write(&temporary_path, &package)
+            .map_err(|err| format!("Could not write {temporary_path:?}: {err}"))?;
+        fs::rename(&package_path, &backup_path).map_err(|err| {
+            let _ = fs::remove_file(&temporary_path);
+            format!("Could not stage the original {package_path:?}: {err}")
+        })?;
+        if let Err(error) = fs::rename(&temporary_path, &package_path) {
+            let rollback = fs::rename(&backup_path, &package_path);
+            let _ = fs::remove_file(&temporary_path);
+            return Err(match rollback {
+                Ok(()) => format!(
+                    "Could not install repaired package {package_path:?}: {error}; original restored"
+                ),
+                Err(rollback_error) => format!(
+                    "Could not install repaired package {package_path:?}: {error}; original remains at {backup_path:?} because rollback failed: {rollback_error}"
+                ),
+            });
+        }
+        fs::remove_file(&backup_path).map_err(|err| {
+            format!(
+                "Installed repaired package {package_path:?}, but could not remove backup {backup_path:?}: {err}"
+            )
+        })?;
+
+        println!(
+            "Repaired {file_name}: {package_segments} low-contrast segment layers / {package_pixels} pixels"
+        );
+        repaired_packages += 1;
+        repaired_segments += package_segments;
+        repaired_pixels += package_pixels;
+    }
+
+    println!(
+        "{} {repaired_packages} packages ({repaired_segments} resolution-specific segment layers / {repaired_pixels} pixels)",
+        if write_changes { "Repaired" } else { "Would repair" }
+    );
+    Ok(())
+}
 
 fn supported_platforms(
     manifest: &HashMap<String, PlatformSpecification>,
@@ -595,8 +875,9 @@ fn refresh_package_configs(
 
     // Build the exact post-refresh candidate in memory and run the same full
     // semantic validator used by --validate-packages before touching any file.
-    // Feature bits and extension descriptors describe immutable payload bytes;
-    // a header-only refresh must never add, remove, or reinterpret them.
+    // Payload feature bits and extension descriptors describe immutable bytes;
+    // a header-only refresh must never add, remove, or reinterpret them. The
+    // startup-sound flag is metadata-only and may be refreshed safely.
     for (_, platform) in &supported {
         let file_name = package_file_name(platform);
         let package_path = output_path.join(package_relative_path(platform));
@@ -672,7 +953,10 @@ fn guard_header_refresh(
             "Package {file_name:?} is shorter than its config header"
         ));
     }
-    if package[0] != expected[0] || package[0x30] != expected[0x30] {
+    let refreshable_feature_mask = FEATURE_DEFAULT_SOUND_ON;
+    if package[0] != expected[0]
+        || (package[0x30] ^ expected[0x30]) & !refreshable_feature_mask != 0
+    {
         return Err(format!(
             "Package {file_name:?} payload features differ from the manifest; regenerate it instead of refreshing its header"
         ));
@@ -1245,14 +1529,14 @@ fn package_file_name(platform: &PlatformSpecification) -> String {
 
 fn package_manufacturer_folder(platform: &PlatformSpecification) -> String {
     match platform.metadata.company.as_str() {
-        "Nintendo" => "Nintendo - Game & Watch".to_string(),
-        "Tiger Electronics" => "Tiger Electronics".to_string(),
-        "Konami" => "Konami".to_string(),
-        "Nelsonic" => "Nelsonic".to_string(),
-        "Elektronika" | "bootleg (Elektronika)" => "Elektronika".to_string(),
-        "Tronica" => "Tronica".to_string(),
+        "Nintendo" => "1. Nintendo".to_string(),
+        "Tiger Electronics" => "2. Tiger Electronics".to_string(),
+        "Konami" => "3. Konami".to_string(),
+        "Nelsonic" => "4. Nelsonic".to_string(),
+        "Elektronika" | "bootleg (Elektronika)" => "5. Elektronika".to_string(),
+        "Tronica" => "6. Tronica".to_string(),
         "VTech" => "VTech".to_string(),
-        "Homebrew" => "Homebrew".to_string(),
+        "Homebrew" => "7. Homebrew".to_string(),
         company => {
             let sanitized: String = company
                 .chars()
@@ -1324,6 +1608,41 @@ fn is_supported(name: &str, platform: &PlatformSpecification) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn package_contrast_repair_is_per_segment_and_idempotent() {
+        fn mask_entry(id: u16, x: usize, length: usize) -> [u8; 5] {
+            let packed = u64::from(id) | ((x as u64) << 10) | ((length as u64) << 30);
+            [
+                packed as u8,
+                (packed >> 8) as u8,
+                (packed >> 16) as u8,
+                (packed >> 24) as u8,
+                (packed >> 32) as u8,
+            ]
+        }
+
+        let mut package = vec![0_u8; 4 * 6 + 3 * 5];
+        for pixel in 0..4 {
+            let offset = pixel * 6;
+            package[offset..offset + 6].copy_from_slice(&[200, 200, 180, 180, 160, 160]);
+        }
+        package[2 * 6..2 * 6 + 6].copy_from_slice(&[200, 20, 180, 30, 160, 40]);
+        package[3 * 6..3 * 6 + 6].copy_from_slice(&[200, 20, 180, 30, 160, 40]);
+        package[24..29].copy_from_slice(&mask_entry(1, 0, 2));
+        package[29..34].copy_from_slice(&mask_entry(2, 2, 2));
+
+        assert_eq!(
+            repair_image_lcd_contrast(&mut package, 0, 4, 1, 24, 15, "test").unwrap(),
+            (1, 2)
+        );
+        assert_eq!(&package[0..6], &[200, 90, 180, 81, 160, 72]);
+        assert_eq!(&package[12..18], &[200, 20, 180, 30, 160, 40]);
+        assert_eq!(
+            repair_image_lcd_contrast(&mut package, 0, 4, 1, 24, 15, "test").unwrap(),
+            (0, 0)
+        );
+    }
 
     fn synthetic_hmc_fixture() -> (PlatformSpecification, Vec<u8>, Vec<u8>) {
         let program = vec![0x5a_u8; 0x800];
@@ -1442,15 +1761,15 @@ mod tests {
                 .or_insert(0_usize) += 1;
         }
         assert_eq!(
-            manufacturer_folders.remove("Nintendo - Game & Watch"),
+            manufacturer_folders.remove("1. Nintendo"),
             Some(59)
         );
-        assert_eq!(manufacturer_folders.remove("Tiger Electronics"), Some(57));
-        assert_eq!(manufacturer_folders.remove("Konami"), Some(20));
-        assert_eq!(manufacturer_folders.remove("Elektronika"), Some(19));
-        assert_eq!(manufacturer_folders.remove("Tronica"), Some(8));
-        assert_eq!(manufacturer_folders.remove("Nelsonic"), Some(3));
-        assert_eq!(manufacturer_folders.remove("Homebrew"), Some(2));
+        assert_eq!(manufacturer_folders.remove("2. Tiger Electronics"), Some(57));
+        assert_eq!(manufacturer_folders.remove("3. Konami"), Some(20));
+        assert_eq!(manufacturer_folders.remove("5. Elektronika"), Some(19));
+        assert_eq!(manufacturer_folders.remove("6. Tronica"), Some(8));
+        assert_eq!(manufacturer_folders.remove("4. Nelsonic"), Some(3));
+        assert_eq!(manufacturer_folders.remove("7. Homebrew"), Some(2));
         assert!(manufacturer_folders.is_empty());
 
         let starfox_hmc = manifest["nstarfox"]
@@ -1470,6 +1789,20 @@ mod tests {
             .filter_map(|(name, platform)| platform.aux_rom.as_ref().map(|_| name.as_str()))
             .collect();
         assert_eq!(auxiliary_titles, ["nstarfox"]);
+
+        let default_sound_titles: Vec<_> = manifest
+            .iter()
+            .filter_map(|(name, platform)| {
+                platform.default_sound_on.unwrap_or(false).then_some(name.as_str())
+            })
+            .collect();
+        assert_eq!(default_sound_titles, ["nsmb3"]);
+        let nsmb3_config =
+            encode_format::build_config(&manifest["nsmb3"], false, false, None).unwrap();
+        assert_eq!(
+            nsmb3_config[0x30] & FEATURE_DEFAULT_SOUND_ON,
+            FEATURE_DEFAULT_SOUND_ON
+        );
 
         let expected_player_two_titles = ["gnw_boxing", "gnw_dkhockey", "gnw_dkong3"];
         let mut actual_player_two_titles = Vec::new();
@@ -1777,7 +2110,10 @@ mod tests {
 
     #[test]
     fn package_header_refresh_preflights_before_writing() {
-        let (platform, expected_header, valid_package) = synthetic_hmc_fixture();
+        let (mut platform, _old_header, valid_package) = synthetic_hmc_fixture();
+        platform.default_sound_on = Some(true);
+        let expected_header =
+            encode_format::build_config(&platform, false, true, Some(5)).unwrap();
         let temp = std::env::temp_dir().join(format!(
             "gnw-header-refresh-test-{}",
             std::process::id()
@@ -1798,6 +2134,7 @@ mod tests {
         refresh_package_configs(&manifest, &temp).expect("valid package should refresh");
         let refreshed = fs::read(&package_path).unwrap();
         assert_eq!(&refreshed[..0x100], expected_header.as_slice());
+        assert_eq!(refreshed[0x30] & FEATURE_DEFAULT_SOUND_ON, FEATURE_DEFAULT_SOUND_ON);
         assert_eq!(&refreshed[0x100..], &valid_package[0x100..]);
 
         let mut stale_invalid_package = valid_package;

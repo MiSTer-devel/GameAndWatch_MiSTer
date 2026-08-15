@@ -1,4 +1,7 @@
-use std::{collections::HashSet, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+};
 
 use image::{imageops::FilterType, DynamicImage, ImageBuffer, Rgba};
 use resvg::tiny_skia::{FilterQuality, Pixmap, PixmapPaint, PremultipliedColorU8};
@@ -600,38 +603,43 @@ fn ensure_lcd_contrast(
     debug_assert_eq!(pixels_to_mask_id.len(), background_pixels.len());
     debug_assert_eq!(pixels_to_mask_id.len(), mask_pixels.len());
 
-    let mut segment_pixels = 0usize;
-    let mut total_delta = 0usize;
+    // Judge each independently addressable LCD segment. A layout can contain
+    // a small group of correctly contrasted status digits alongside a much
+    // larger set of segment shapes that are byte-identical to the inactive
+    // background. A whole-screen average lets the good group hide all of the
+    // missing gameplay graphics (as happened in Crab Grab and Spitball
+    // Sparky).
+    let mut segment_stats: HashMap<u16, (usize, usize)> = HashMap::new();
 
     for i in 0..pixels_to_mask_id.len() {
-        if pixels_to_mask_id[i].is_none() {
+        let Some(segment_id) = pixels_to_mask_id[i] else {
             continue;
-        }
-
-        segment_pixels += 1;
+        };
 
         let background = background_pixels[i];
         let mask = mask_pixels[i];
-
-        total_delta += usize::from(background.red().abs_diff(mask.red()));
-        total_delta += usize::from(background.green().abs_diff(mask.green()));
-        total_delta += usize::from(background.blue().abs_diff(mask.blue()));
+        let delta = usize::from(background.red().abs_diff(mask.red()))
+            + usize::from(background.green().abs_diff(mask.green()))
+            + usize::from(background.blue().abs_diff(mask.blue()));
+        let stats = segment_stats.entry(segment_id).or_insert((0, 0));
+        stats.0 += 1;
+        stats.1 += delta;
     }
 
     // Some MAME artwork layers are technically different from the background
     // but only by one or two RGB counts, which is invisible on the core.
     // Treat those as no-contrast LCD foregrounds and synthesize a usable
     // active-segment layer from the real mask geometry.
-    let low_contrast_limit = segment_pixels * 3;
-
-    if segment_pixels == 0 || total_delta > low_contrast_limit {
-        return;
-    }
-
     let mask_pixels = output_mask.pixels_mut();
 
     for i in 0..pixels_to_mask_id.len() {
-        if pixels_to_mask_id[i].is_none() {
+        let Some(segment_id) = pixels_to_mask_id[i] else {
+            continue;
+        };
+        let Some((segment_pixels, total_delta)) = segment_stats.get(&segment_id) else {
+            continue;
+        };
+        if *segment_pixels == 0 || *total_delta > segment_pixels * 3 {
             continue;
         }
 
@@ -906,5 +914,26 @@ mod tests {
         let expanded_pixmap = expand_pixmap(&source, target);
         assert_eq!(expanded_pixmap.width(), 360);
         assert_eq!(expanded_pixmap.height(), 240);
+    }
+
+    #[test]
+    fn contrast_fallback_is_applied_per_lcd_segment() {
+        let background_color = PremultipliedColorU8::from_rgba(200, 180, 160, 255).unwrap();
+        let visible_color = PremultipliedColorU8::from_rgba(20, 30, 40, 255).unwrap();
+        let mut background = Pixmap::new(4, 1).unwrap();
+        background.pixels_mut().fill(background_color);
+        let mut foreground = background.clone();
+        foreground.pixels_mut()[2] = visible_color;
+        foreground.pixels_mut()[3] = visible_color;
+
+        let ids = vec![Some(1), Some(1), Some(2), Some(2)];
+        ensure_lcd_contrast(&mut foreground, &background, &ids);
+
+        let expected_fallback =
+            PremultipliedColorU8::from_rgba(90, 81, 72, 255).unwrap();
+        assert_eq!(foreground.pixels()[0], expected_fallback);
+        assert_eq!(foreground.pixels()[1], expected_fallback);
+        assert_eq!(foreground.pixels()[2], visible_color);
+        assert_eq!(foreground.pixels()[3], visible_color);
     }
 }

@@ -14,6 +14,7 @@ pub fn get_assets(
     parent_name: Option<&str>,
     owning_rom_name: &Option<String>,
     artwork_dir: &Path,
+    artwork_subdirectory: Option<&str>,
     rom_dir: &Path,
     sample_dir: Option<&Path>,
     sample_set: Option<&str>,
@@ -26,10 +27,19 @@ pub fn get_assets(
     fs::create_dir_all(temp_dir)
         .map_err(|err| format!("Could not create temporary asset directory {temp_dir:?}: {err}"))?;
 
-    let artwork_path = artwork_dir
+    let standard_artwork_path = artwork_dir
         .join("foo")
         .with_file_name(platform_name)
         .with_extension("zip");
+    let artwork_path = artwork_subdirectory
+        .map(|subdirectory| {
+            artwork_dir
+                .join(subdirectory)
+                .join("foo")
+                .with_file_name(platform_name)
+                .with_extension("zip")
+        })
+        .unwrap_or_else(|| standard_artwork_path.clone());
 
     let roms_path = rom_dir
         .join("foo")
@@ -59,7 +69,18 @@ pub fn get_assets(
         }
     }
 
-    if let Err(artwork_error) = extract_path(&artwork_path, temp_dir, "artwork") {
+    let artwork_result = extract_path(&artwork_path, temp_dir, "artwork").or_else(|override_error| {
+        if artwork_path == standard_artwork_path {
+            Err(override_error)
+        } else {
+            extract_path(&standard_artwork_path, temp_dir, "standard artwork").map_err(
+                |standard_error| format!(
+                    "{override_error}\nPreferred artwork fallback also failed:\n{standard_error}"
+                ),
+            )
+        }
+    });
+    if let Err(artwork_error) = artwork_result {
         let fallback_name = parent_name.or(owning_rom_name.as_deref());
         if let Some(fallback_name) = fallback_name.filter(|name| *name != platform_name) {
             let fallback_path = artwork_dir
@@ -166,6 +187,7 @@ mod tests {
             Some("parent"),
             &parent,
             &artwork,
+            None,
             &roms,
             None,
             None,

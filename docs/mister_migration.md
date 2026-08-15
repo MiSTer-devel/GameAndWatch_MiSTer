@@ -749,3 +749,112 @@ analog adapter.
   core/video setup or hold paths, and leaves no intentional async-reset
   recovery/removal residue. The new RBF has not been deployed or hardware-smoked;
   the prior request-locked artifact remains the latest USB-2 hardware evidence.
+
+## 2026-08-14 tester display and artwork corrections
+
+- Reproduced the reported live-mode failure on USB-2. The old transport left
+  the 360x240 raster running while content stayed blank because the source
+  waited for an additional externally paced CRT pixel before acknowledging a
+  vertical-blank hold. The source now freezes on the next source clock after
+  synchronized hold; its counters and packet bus are already stable between
+  pixel enables.
+- Native FIFO acquisition no longer depends on an SOF marker surviving an
+  asynchronous reset. Native packets contain complete sync, blanking, DE, and
+  RGB state, so cold starts and held releases prefill from any buffered packet
+  and settle at the following sync. CRT recovery retains strict SOF/local-frame
+  alignment because its output raster is independently owned.
+- Behavioral and Quartus vendor-FIFO bidirectional tests pass more than 5.32
+  million checks. A separate cold-start test releases the bridge with the
+  native source already mid-frame and reaches active RGB under both FIFO
+  models. The timing regression passes 528,490 checks.
+- The zero-error Quartus 17.0.2 build is 3,489,604 bytes with SHA-256
+  `2b492710cd75eff518eba28019a7572e2c391e4af6622de57470e2d08fb36178`.
+  Fit uses 13,357 ALMs, 18,109 registers, 3,017,509 block-memory bits, 379 RAM
+  blocks, 36 DSPs, and four PLLs. Video setup is +8.324 ns. Core setup is
+  -0.423 ns / -4.014 ns TNS, within the accepted one-nanosecond floor but not
+  strict timing closure; hold, recovery, removal, and pulse width are positive.
+- USB-2 verified both a live CRT-to-native transition and a cold native boot.
+  Both produced the same nonblack 720x720 Star Fox capture (`b7f269af...`).
+  Reloading the byte-exact restored zero CFG returned the known-good 360x240
+  capture (`8e375ba3...`). The active test core is
+  `/media/fat/_Dev/GameAndWatch-testerfix2-2b492710cd75.rbf`.
+- Corrected LCD visibility per segment ID rather than per whole screen. Crab
+  Grab, Pinball, and Spitball Sparky now expose their previously background-
+  colored gameplay segments. Nu Pogodi is rebuilt from the complete
+  `alternates/hydef` artwork selected by the extractor-generated manifest.
+  All 168 packages validate, their new ordinal aggregate is
+  `ed6e4a4544eec5cd0443134bb26424cac6a59fad84241006431ab673a31bd4ea`,
+  and the refreshed manufacturer-organized `Roms.zip` hash is
+  `712790fcf112c972ee42859515f670ff3143d821ac97baaebc20a40d1c96106b`.
+- Nelsonic Super Mario Bros. 3 remains intentionally unchanged: the normal
+  game path can be silent because firmware boots with its sound/alarm bit
+  clear. The authentic alarm-setting UI path sets the bit and executes `SME`;
+  forcing sound in the core or package would be inaccurate.
+
+## 2026-08-14 Nelsonic SMB3 default sound compatibility
+
+- Superseding the authentic-default decision immediately above, the user
+  explicitly chose a convenience default: the generated `nsmb3` package now
+  carries descriptorless feature bit `0x20`. For that package only, SM530 CPU
+  reads of firmware RAM `0x37` see bit 3 asserted. Stored RAM, the exact
+  `633.program`, and exact `633.melody` bytes remain unchanged; the firmware
+  reaches its existing `SME` instruction rather than receiving a synthetic
+  audio trigger or patched opcode.
+- Added `Audio: On/Mute` at MiSTer status bit 11. It defaults on and gates only
+  the final signed audio output, so muting does not perturb melody, voice, HMC,
+  CPU, or RAM state.
+- The exact-ROM RTL start regression waits through boot, presses Mode and Down,
+  observes `SME`, and counts 15,402 R-output transitions. The focused RAM test
+  verifies the override is limited to SM530 address `0x37` bit 3; SM510-family
+  ACL/opcode regressions remain clean. The generator passes 29 locked tests,
+  TypeScript parser tests and strict typecheck, and validates all 168 packages.
+- Header refresh changed only SMB3 feature byte `0x30` plus the common generator
+  stamp relative to the previous SMB3 file; payload bytes are unchanged. The
+  168-package ordinal aggregate is
+  `c6aca96b6be2ccb58bb8f9b2c6a80e46cd4ba2ad00eaf267a719b772666a67ae`.
+  The refreshed manufacturer archive SHA-256 is
+  `c1cd1e4f01b6c37bdf9c7b66cf2a13afcbb62c97421356d2bc0801b167449a28`.
+- The zero-error Quartus 17.0.2 build produced
+  `releases/GameAndWatch_20260814_sounddefault.rbf`, 3,503,712 bytes, SHA-256
+  `01dbba785ae1dad7a9f8c542ae2511cd700befb3a17783dd331659f5b96c02d8`.
+  Fit uses 13,534 ALMs, 18,197 registers, 3,017,509 block-memory bits, 379 RAM
+  blocks, 36 DSPs, and four PLLs. Video setup is `+8.319 ns`; core setup is
+  `-0.108 ns` / TNS `-0.226 ns`, within the accepted one-nanosecond floor but
+  not strict zero-slack closure. Hold, recovery, removal, and minimum-pulse
+  checks are positive. This RBF has not yet been deployed or audibly checked.
+
+## 2026-08-14 native 720x720 elastic-buffer stabilization
+
+- USB-2 screenshot diagnostics reproduced intermittent native partial-black and
+  full-black frames, then identified every bad transition as packet-FIFO empty;
+  overflow, SOF mismatch, mode/hold changes, and reset were not observed.
+- Kept the externally visible raster unchanged at 720x720 active, 756x730
+  total, exactly 32.768 MHz, and approximately 59.375 Hz. Native timing is
+  output-owned, so recovery can black RGB without disturbing sync, blanking,
+  DE, pixel enable, or raster coordinates.
+- Changed only the internal native producer to exact core-clock `/3` pacing:
+  `524375/1573125`, or 32.7734375 MHz from the mapped 98.3203125 MHz clock.
+  This is a deterministic 5,437.5-packet/s lead and preserves the compositor's
+  required minimum three-core-clock pixel interval.
+- Added read-domain hysteresis: pause the native source at FIFO occupancy 768
+  and resume it at 640. The pause freezes only the source NCO and compositor
+  coordinates; it does not gate FIFO acceptance or the output raster. Its
+  long-term effective producer rate therefore equals the consumer rate.
+- Updated timing, rate-balance, source-packet, bidirectional transport, and
+  native recovery regressions. The native test exercises a complete 768-to-640
+  pause cycle, ordered full frames, and forced overflow recovery under both the
+  behavioral and production Quartus 17 FIFO models.
+- The clean Quartus 17.0.2 flow completed with zero errors and produced
+  `output_files/GameAndWatch.rbf`, 3,494,544 bytes, SHA-256
+  `16e14b86eba8c9422f9c6f9e966ba5c01627659193d6edd7070912b556dbef6f`.
+  Fit uses 13,563 ALMs, 18,176 registers, 3,014,437 memory bits, 379 RAM blocks,
+  36 DSP blocks, and four PLLs. Core setup is -0.401 ns / TNS -0.587 ns,
+  within the accepted one-nanosecond floor but not strict zero-slack closure;
+  hold +0.206 ns, recovery +2.591 ns, and removal +0.689 ns are positive.
+- Deployed the hash-qualified RBF only to USB-2 as
+  `/media/fat/_Dev/GameAndWatch-native-elastic-16e14b86eba8.rbf`. With Direct
+  Video disabled and Star Fox selected, 60 one-second-spaced 720x720 captures
+  contained no partial or black frames. The first was the normal startup
+  transition; captures 1-59 were byte-identical with SHA-256
+  `b7f269af912bef9752429730f35f5b148af60ac10d60445d3b22065d24c01fcc`.
+  The saved zero CFG and prior core were restored exactly after the test.

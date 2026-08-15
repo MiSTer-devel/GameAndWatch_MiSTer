@@ -5,7 +5,7 @@ The core has two package-native video modes. `360x240 CRT` is the default; `720x
 | Mode | Package/source raster | Source cadence | Output raster | Output cadence | Horizontal | Frame |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | `360x240 CRT` | 360 x 240 active, 429 x 262 total | exactly 6.750 MHz average | 360 x 240 active, 429 x 262 total | 6.750 MHz (`CE_PIXEL` /8 at 54 MHz) | 15.7343 kHz | 60.0545 Hz |
-| `720x720` | 720 x 720 active, 756 x 730 total | 32.768 MHz | source timing preserved | exactly 32.768 MHz average | 43.344 kHz | 59.375 Hz |
+| `720x720` | 720 x 720 active, 756 x 730 total | exactly 32.7734375 MHz | 720 x 720 active, 756 x 730 total | exactly 32.768 MHz average | 43.344 kHz | 59.375 Hz |
 
 CRT mode reports 4:3 to the MiSTer scaler. The 720x720 mode reports 1:1.
 
@@ -36,7 +36,7 @@ Compatibility with a particular CRT, transcoder, HDMI-to-analog adapter, or MiST
 
 Quartus 17 maps the core PLL requested as 98.304 MHz to an actual 98.3203125 MHz (`12585/128 MHz`) clock. Native pacing is derived from that mapped value, while production CRT pacing is locked to requests from the output transport:
 
-- native uses an increment of 524288 modulo 1573125 for exactly 32.768 MHz, with three/four-clock gaps;
+- native uses an increment of 524375 modulo 1573125, exactly one source pixel every three core clocks or 32.7734375 MHz;
 - CRT toggles one request for each fixed 54 MHz `/8` output slot; a two-flop synchronizer turns each toggle into one source pixel request.
 
 Complete timing/control/RGB packets cross to the output domain through a dual-clock FIFO. The CRT producer is therefore demand-locked to the consumer rather than merely frequency-matched to it.
@@ -44,7 +44,15 @@ Complete timing/control/RGB packets cross to the output domain through a dual-cl
 `CLK_VIDEO` is a separate, free-running 54.000 MHz PLL output connected directly to the MiSTer `emu` boundary. It is not selected through a core-owned clock mux, because the framework places its own clock selector after that boundary. The output bridge provides:
 
 - CRT: exact `CE_PIXEL` /8, or 6.750 MHz, with one output sample for each 360-wide package/source pixel;
-- native: exact-average 32.768 MHz packet consumption using a `2048/3375` accumulator on 54 MHz, preserving the existing 720x720 timing fields for normal scaler use.
+- native: exact-average 32.768 MHz packet consumption using a `2048/3375` accumulator on 54 MHz, with a locally owned 720x720 active / 756x730 total raster for normal scaler use.
+
+Native deliberately gives the internal producer a 5,437.5-packet/s lead. The
+output bridge pauses that producer when FIFO occupancy reaches 768 words and
+resumes it at 640 words. Only the source NCO and compositor coordinates pause;
+the visible 54 MHz clock, pixel-enable cadence, counters, sync, blanking, and DE
+continue without interruption. The producer's long-term effective rate
+therefore equals the unchanged 32.768 MHz consumer rate while short service
+gaps no longer drain the FIFO.
 
 Both modes are emitted by the fixed-clock bridge, but raw Direct Video support is intentionally claimed only for `360x240 CRT`. The live-selectable 720x720 mode is not required or supported over Direct Video; it remains available through MiSTer's scaler path.
 
@@ -73,7 +81,7 @@ Changing `Native Video` does not reload the `.gnw` file. The core:
 
 Coordinates, blanking, data enable, and mode identity are captured as one synchronous next-pixel packet. The preload path uses the stable active mode throughout hold/settle, including the old-package fallback, so a live switch does not defer the legacy X-step change until the first displayed pixel.
 
-The output bridge flushes and rearms its asynchronous packet FIFO around a mode change, searches for the next complete source start-of-frame packet, and prefills while requesting CRT source pixels. It then holds that source SOF and stops requesting new packets until the next local 429x262 frame boundary. Only then does it enter run state and consume one packet per `/8` output slot. Once CRT mode is active, its `/8` enable, counters, sync, blanking, and DE continue independently through FIFO search or recovery; missing packet content is blacked without interrupting the raster. This prevents a recovered source frame from being spliced into an arbitrary output coordinate. `CLK_VIDEO` remains fixed at 54.000 MHz in both menu modes.
+The output bridge flushes and rearms its asynchronous packet FIFO around a mode change. Both modes discard partial buffered frames and hold the next complete source start-of-frame packet through prefill. Native mode aligns that held source SOF to the next boundary of its locally owned 756x730 raster; packet-carried timing fields are ignored after acquisition. CRT mode similarly waits for the next local 429x262 frame boundary. In both modes, local counters, sync, blanking, and DE continue independently through FIFO search or recovery; unavailable RGB is blacked without interrupting the raster. `CLK_VIDEO` remains fixed at 54.000 MHz in both menu modes.
 
 Raster timing free-runs before a package is loaded and while content is reset. RGB is blanked independently, keeping OSD timing alive at boot.
 
@@ -85,12 +93,12 @@ The extension offsets and fixed package end remain unchanged from the superseded
 
 ## Current Verification Boundary
 
-The source-packet audit completes 52,012 checks with zero errors and zero warnings. It verifies atomic start-of-frame/control/RGB alignment, exact native cadence, request-locked CRT cadence, packet hold behavior, and content-reset blanking. A deliberately detuned source-clock multiframe regression passes 2,697,554 checks across three complete CRT frames with FIFO occupancy fixed at 511 words. Forced recovery passes 2,900,283 checks with uninterrupted CRT CE/sync/DE/blanking plus absolute RGB-coordinate assertions, source-SOF hold, and local-frame alignment using both the behavioral FIFO and Quartus 17's vendor `dcfifo` model. The existing focused timing, mode-change, preload, loader, mask, and segment-to-RGB regressions remain applicable.
+The source-packet audit completes 51,982 checks with zero errors and zero warnings. The timing audit completes 528,577 checks and proves exact native `/3` source pacing plus the unchanged CRT fourteen/fifteen-clock cadence. The common-period rate test proves an exact 5,437.5-packet/s native lead. The bidirectional transport regression passes 4,514,895 checks. The native elastic-buffer regression exercises a complete 768-to-640 pause cycle, ordered full frames, and forced overflow recovery; it passes with both the behavioral FIFO model (1,555,639 active pixels, maximum level 767) and the production Quartus 17 `dcfifo` model (1,555,200 active pixels, maximum level 768). The vendor run has only the two inherited Intel model port warnings.
 
-The regenerated set contains 168 packages of `0x442AC0` bytes each and passes full-directory validation. Its ordinal-filename-sorted lines aggregate SHA-256 is `17a70cfd698464cdc020f4a1ae1de4cf0831878be253b6deccca4da16d9b9e67`.
+The regenerated set contains 168 packages of `0x442AC0` bytes each and passes full-directory validation. Its ordinal-filename-sorted lines aggregate SHA-256 is `ed6e4a4544eec5cd0443134bb26424cac6a59fad84241006431ab673a31bd4ea`.
 
-The debug-free Quartus 17.0.2 build completed with zero errors. `output_files/GameAndWatch.rbf` and `releases/GameAndWatch_20260813_nodebug_timing.rbf` are byte-identical at 3,488,500 bytes with SHA-256 `5F38DEB3152B422E2D999A02AB0F4E50DE7DEB3572834073D74FB45AA059E14B`. Normal builds leave `CORE_ENABLE_DEBUG_OVERLAY` undefined, so the diagnostic menu/capture/grid is not synthesized. The fit uses 13,443 ALMs (32%), 18,115 registers, 3,017,509 block-memory bits (53%), 379 RAM blocks (69%), 36 DSP blocks (32%), and four PLLs (67%).
+The debug-free Quartus 17.0.2 build completed with zero errors. `output_files/GameAndWatch.rbf` is 3,494,544 bytes with SHA-256 `16E14B86EBA8C9422F9C6F9E966BA5C01627659193D6EDD7070912B556DBEF6F`. Normal builds leave all three debug/diagnostic QSF macros undefined. The fit uses 13,563 ALMs (32%), 18,176 registers, 3,014,437 block-memory bits (53%), 379 RAM blocks (69%), 36 DSP blocks (32%), and four PLLs (67%).
 
-TimeQuest reports `+8.155 ns` setup slack for the 54 MHz video domain. All custom packet-FIFO, reset, mode-toggle, request-toggle, and framework CDC guards matched their intended fitted nodes; the final audit found all four Gray-pointer arc sets at 11 paths, the request-toggle synchronizer timed, and zero unexpected non-FIFO setup/hold crossings. Worst overall hold is `+0.246 ns`; recovery is `+3.538 ns`, removal `+0.616 ns`, and minimum pulse width `+0.925 ns`.
+All custom packet-FIFO, reset, mode-toggle, pause-toggle, request-toggle, and framework CDC guards matched their intended fitted nodes. Worst overall hold is `+0.206 ns`; recovery is `+2.591 ns`, and removal is `+0.689 ns`.
 
-The 98.3203125 MHz core domain reports `-0.605 ns` / `-1.917 ns` TNS, within the accepted one-nanosecond task floor but not strict zero-slack closure. Registering the package image-write address/data removed the former live `ioctl_addr` to SDRAM-pin critical cone; remaining misses are real one-cycle paths wholly inside the vendored SDRAM command/address state machine. The new RBF has not been deployed. The preceding request-locked build remains hash-verified on USB-2 at `/media/fat/_Dev/GameAndWatch-54MHz-360-requestlock-08d6a4ba78ec.rbf`; with Direct Video off, nine Star Fox screenshots at four-second intervals were byte-identical 360x240 frames. Morph/analog lock for the actual 360-wide transport remains a user test.
+The 98.3203125 MHz core domain reports `-0.401 ns` / `-0.587 ns` TNS, within the accepted one-nanosecond task floor but not strict zero-slack closure. The RBF is hash-verified on USB-2 at `/media/fat/_Dev/GameAndWatch-native-elastic-16e14b86eba8.rbf`. With Direct Video off and Star Fox selected, 60 screenshots were captured one second apart. Frame 0 was the normal startup transition; frames 1 through 59 were byte-identical 720x720 images with SHA-256 `b7f269af912bef9752429730f35f5b148af60ac10d60445d3b22065d24c01fcc`, with no partial or black frames. The saved zero CFG and prior core were restored exactly. Morph/analog lock remains a user test.

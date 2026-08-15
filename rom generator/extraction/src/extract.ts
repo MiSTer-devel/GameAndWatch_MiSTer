@@ -60,6 +60,18 @@ const homebrewTitles = {
   hbw_squeeze: { game: "gnw_mickdon", name: "Squeeze", year: "2018" },
 };
 
+// Title-specific artwork sources which are complete and better aligned than
+// the default MAME artwork ZIP. Keep this in the extractor so regenerating
+// the ignored manifest.json retains the selection.
+const artworkSubdirectories: Record<string, string> = {
+  nupogodi: "alternates/hydef",
+};
+
+// The Nelsonic SMB3 firmware uses its alarm-enable RAM bit as the game-melody
+// gate and boots with that bit clear. Mark only this exact title for the
+// optional core-side startup-sound compatibility behavior.
+const defaultSoundOnTitles = new Set(["nsmb3"]);
+
 const parseSystems = (file: string): SystemDefinition[] => {
   const systems: SystemDefinition[] = [];
 
@@ -309,6 +321,8 @@ const run = () => {
       unsupportedReason: stateUnsupportedReasons[system.stateClass],
       voice: hasVoice ? voice : undefined,
       auxRom: rom.auxRom,
+      artworkSubdirectory: artworkSubdirectories[system.name],
+      defaultSoundOn: defaultSoundOnTitles.has(system.name) || undefined,
     };
   }
 
